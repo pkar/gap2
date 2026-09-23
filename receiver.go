@@ -2,11 +2,18 @@ package airplay2
 
 import (
 	"context"
+	"encoding/base64"
+	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/pkar/gap2/internal/hap"
+	"github.com/pkar/gap2/internal/zeroconf"
 )
 
 // Status is a stable snapshot of a Receiver.
@@ -38,6 +45,7 @@ type Receiver struct {
 	closed       bool
 	eventsClosed bool
 	ln           net.Listener
+	adv          *zeroconf.Advertiser
 
 	droppedEvents atomic.Int64
 }
@@ -74,11 +82,17 @@ func (r *Receiver) Run(ctx context.Context) (err error) {
 
 	defer func() {
 		r.mu.Lock()
-		if r.ln != nil {
-			_ = r.ln.Close()
-			r.ln = nil
-		}
+		ln := r.ln
+		adv := r.adv
+		r.ln = nil
+		r.adv = nil
 		r.mu.Unlock()
+		if ln != nil {
+			_ = ln.Close()
+		}
+		if adv != nil {
+			_ = adv.Close()
+		}
 		if err != nil {
 			r.mu.Lock()
 			r.setStateLocked(StateFailed)
@@ -108,7 +122,17 @@ func (r *Receiver) Run(ctx context.Context) (err error) {
 
 	s := newControlServer(r.cfg, identity, store)
 
+	adv, derr := startDiscovery(ctx, r.cfg, ln.Addr(), identity, store)
 	r.mu.Lock()
+	if derr == nil {
+		r.adv = adv
+	} else {
+		// Discovery is best-effort: a receiver can still serve control and
+		// pairing over a directly-reachable address when multicast is
+		// unavailable (for example, in containers or on hosts that already
+		// own the mDNS port).
+		r.log.Warn("mDNS discovery unavailable", "err", derr)
+	}
 	r.setStateLocked(StateRunning)
 	r.mu.Unlock()
 
@@ -156,16 +180,24 @@ func (r *Receiver) Status() Status {
 // the context passed to Run.
 func (r *Receiver) Close() error {
 	r.mu.Lock()
+	var ln net.Listener
+	var adv *zeroconf.Advertiser
 	if !r.closed {
 		r.closed = true
-		if r.ln != nil {
-			_ = r.ln.Close()
-		}
+		ln = r.ln
+		adv = r.adv
 		if r.state == StateIdle || r.state == StateStarting {
 			r.setStateLocked(StateStopped)
 		}
 	}
 	r.mu.Unlock()
+
+	if ln != nil {
+		_ = ln.Close()
+	}
+	if adv != nil {
+		_ = adv.Close()
+	}
 
 	r.closeEvents()
 	return nil
@@ -213,4 +245,98 @@ func (r *Receiver) closeEvents() {
 		r.mu.Unlock()
 		close(r.events)
 	})
+}
+
+// startDiscovery opens and announces the mDNS advertiser for the receiver's
+// AirPlay and RAOP service instances. A non-nil error means the receiver runs
+// without discovery; callers decide whether that is acceptable.
+func startDiscovery(ctx context.Context, cfg Config, addr net.Addr, identity hap.Identity, store *pairingStore) (*zeroconf.Advertiser, error) {
+	port, err := portFromAddr(addr)
+	if err != nil {
+		return nil, err
+	}
+	mac := store.deviceID()
+	hostname := strings.ToLower(strings.ReplaceAll(mac, ":", ""))
+	if hostname == "" {
+		hostname = "airplay"
+	}
+
+	services := []zeroconf.Service{
+		{
+			Type:     "_airplay._tcp",
+			Instance: cfg.Name,
+			TXT:      airplayTXT(mac, identity),
+		},
+		{
+			Type:     "_raop._tcp",
+			Instance: hostname + "@" + cfg.Name,
+			TXT:      raopTXT(),
+		},
+	}
+
+	adv, err := zeroconf.New(zeroconf.Config{
+		Hostname:   hostname,
+		Port:       port,
+		Services:   services,
+		Interfaces: cfg.Interfaces,
+		Logger:     cfg.Logger,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := adv.Start(ctx); err != nil {
+		return nil, err
+	}
+	return adv, nil
+}
+
+func portFromAddr(addr net.Addr) (int, error) {
+	_, port, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return 0, fmt.Errorf("airplay2: parse listen port: %w", err)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return 0, fmt.Errorf("airplay2: parse listen port: %w", err)
+	}
+	return n, nil
+}
+
+// airplayTXT builds the DNS-SD TXT record set for the _airplay._tcp instance.
+func airplayTXT(mac string, identity hap.Identity) []string {
+	return []string{
+		"txtvers=1",
+		"deviceid=" + mac,
+		"features=0x5A7FFFF7,0x1E",
+		"flags=0x4",
+		"model=AppleTV6,2",
+		"pk=" + base64.StdEncoding.EncodeToString(identity.PublicKey()),
+		"pi=" + string(identity.ID),
+		"srcvers=366.0",
+		"vv=2",
+	}
+}
+
+// raopTXT builds the DNS-SD TXT record set for the legacy _raop._tcp
+// instance. It advertises AirPlay 2 capability through the "am" key so
+// clients that first discover RAOP know this target also speaks AirPlay 2.
+func raopTXT() []string {
+	return []string{
+		"txtvers=1",
+		"ch=2",
+		"cn=0,1,2,3",
+		"et=0,3,5",
+		"sv=false",
+		"da=true",
+		"sr=44100",
+		"ss=16",
+		"pw=false",
+		"vn=3",
+		"tp=UDP",
+		"sm=false",
+		"ek=1",
+		"md=0,1,2",
+		"am=AirPlay2",
+		"vs=366.0",
+	}
 }
