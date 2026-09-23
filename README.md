@@ -5,12 +5,13 @@ module and a standalone command that wraps the same API.
 
 ## Status
 
-**Phase 1 foundation only.** This repository currently provides the public
-lifecycle and PCM contracts plus deterministic, tested protocol-building
-blocks (bounded RTSP parsing, TLV8, timing helpers, counters, a session state
-machine, and a raw PCM sink). Discovery, pairing, encrypted control, media
-transport, codecs, and synchronized playback are not implemented yet and are
-reported as such rather than simulated.
+**In progress.** The public lifecycle, pairing, discovery, and PCM contracts
+plus deterministic protocol-building blocks are implemented and tested.
+Discovery, HAP pairing, and the encrypted control transport are committed.
+Buffered playback is partially implemented: ADTS framing and a realtime PCM
+playout scheduler exist, but AAC-LC bitstream decoding and the RTSP media
+session are not implemented yet and are reported as such rather than
+simulated.
 
 ## Layout
 
@@ -20,6 +21,10 @@ pcm/                    PCM formats, blocks, and sink contracts
 output/pcmfile/         deterministic raw-PCM sink for tests and capture
 internal/rtsp/          bounded RTSP-like message parser
 internal/tlv8/          HomeKit-style TLV8 encode/decode with fragmentation
+internal/hap/           HAP pairing, HKDF/SRP, and encrypted control transport
+internal/zeroconf/      mDNS/DNS-SD advertisement
+internal/aac/           bounded ADTS framing for AAC audio
+internal/playout/       buffered realtime PCM playout scheduler
 internal/timing/        clock and sample-rate conversion helpers
 internal/observability/ small thread-safe counters
 internal/session/       per-session state machine
