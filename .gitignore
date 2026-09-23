@@ -1,0 +1,18 @@
+# Build artifacts
+/airplay2-receiver
+/bin/
+/dist/
+
+# Local runtime state (identity, pairings)
+/pairings/
+/state/
+*.db
+*.sqlite
+
+# Test coverage
+*.out
+coverage.txt
+
+# Editor and OS
+.DS_Store
+*.swp
