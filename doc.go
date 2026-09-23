@@ -7,8 +7,9 @@
 // This is an early-stage implementation. The current milestone provides the
 // public lifecycle, PCM contracts, deterministic protocol-building blocks,
 // HomeKit Accessory Protocol pairing (Pair Setup and Pair Verify), an encrypted
-// control transport, persistent or transient pairings, and a control endpoint
-// that serves discovery info and pairing over TCP. mDNS discovery, media
-// transport, codecs, and synchronized playback are implemented in subsequent
-// milestones and are not yet available.
+// control transport, persistent or transient pairings, a control endpoint that
+// serves discovery info and pairing over TCP, and mDNS discovery. Media and
+// codec groundwork is in progress (ADTS framing, RTP parsing, an AAC synthesis
+// IMDCT, and a buffered PCM playout scheduler); full AAC-LC/ALAC decoding and
+// synchronized playback are not yet available.
 package airplay2
