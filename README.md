@@ -3,9 +3,6 @@
 `gap2` is a pure-Go AirPlay 2 audio receiver delivered as an importable Go
 module and a standalone command that wraps the same API.
 
-Implementation follows the plan maintained at
-`~/work/agents/plans/pure-go-airplay2-receiver.md`.
-
 ## Status
 
 **Phase 1 foundation only.** This repository currently provides the public
