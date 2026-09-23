@@ -9,6 +9,10 @@ import (
 	"context"
 	"errors"
 	"net"
+
+	"github.com/pkar/gap2/internal/sdp"
+	"github.com/pkar/gap2/internal/stream"
+	"github.com/pkar/gap2/pcm"
 )
 
 // maxDatagram bounds the receive buffer. It is far larger than any realistic
@@ -73,4 +77,66 @@ func (r *Receiver) Serve(ctx context.Context, handle func(pkt []byte) error) err
 // Close closes the underlying connection, unblocking any in-progress Serve.
 func (r *Receiver) Close() error {
 	return r.conn.Close()
+}
+
+// Session coordinates one media stream's UDP receive pipeline: it owns the
+// per-stream decoder/sink state and the receiver that feeds RTP datagrams into
+// it. The RTSP control layer drives Session through the ANNOUNCE/SETUP/RECORD
+// lifecycle; this type keeps that wiring independent of the wire protocol.
+type Session struct {
+	stream *stream.Stream
+	recv   *Receiver
+}
+
+// NewSession builds a Session for the announced media, decoding into sink. The
+// stream is left in StateNew until its Announce method is called by the RTSP
+// layer.
+func NewSession(id string, m *sdp.Media, sink pcm.Sink) (*Session, error) {
+	dec, err := stream.NewDecoder(m)
+	if err != nil {
+		return nil, err
+	}
+	return &Session{stream: stream.New(id, dec, sink)}, nil
+}
+
+// Stream exposes the underlying stream so the RTSP layer can advance its
+// announce/setup/record state and query the derived format.
+func (s *Session) Stream() *stream.Stream { return s.stream }
+
+// Bind binds the RTP receiver on the given network/address and returns the
+// bound UDP port for the RTSP SETUP response. Port 0 selects an ephemeral port.
+func (s *Session) Bind(network, addr string) (int, error) {
+	recv, err := Listen(network, addr)
+	if err != nil {
+		return 0, err
+	}
+	s.recv = recv
+	ua, ok := recv.Addr().(*net.UDPAddr)
+	if !ok {
+		return 0, errors.New("media: receiver did not bind a UDP address")
+	}
+	return ua.Port, nil
+}
+
+// setReceiver injects a receiver, used by tests to avoid real sockets.
+func (s *Session) setReceiver(recv *Receiver) { s.recv = recv }
+
+// Serve reads RTP datagrams and feeds each to the stream until ctx is
+// cancelled. It requires a prior Bind (or setReceiver). It returns nil on clean
+// shutdown.
+func (s *Session) Serve(ctx context.Context) error {
+	if s.recv == nil {
+		return errors.New("media: serve before bind")
+	}
+	return s.recv.Serve(ctx, func(pkt []byte) error {
+		return s.stream.IngestRTP(ctx, pkt)
+	})
+}
+
+// Close tears down the receiver, unblocking any in-progress Serve.
+func (s *Session) Close() error {
+	if s.recv == nil {
+		return nil
+	}
+	return s.recv.Close()
 }
