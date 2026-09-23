@@ -27,32 +27,22 @@ func KBDWindow(n int, alpha float64) []float64 {
 		return nil
 	}
 
-	// Kaiser kernel over half+1 points, matching the AAC KBD derivation.
-	alpha2 := 4 * math.Pow(alpha*math.Pi/float64(n), 2)
-	temp := make([]float64, half/2+1)
-	var denom float64
-	for i := range temp {
-		temp[i] = besselI0(math.Sqrt(float64(i*(n-i)) * alpha2))
-		weight := 1.0
-		if i != 0 && i < half/2 {
-			weight = 2.0
-		}
-		denom += temp[i] * weight
+	// Kaiser kernel over half+1 points (ISO 14496-3 4.6.14.4.1.1).
+	kernel := make([]float64, half+1)
+	for i := 0; i <= half; i++ {
+		x := 2*float64(i)/float64(half) - 1
+		kernel[i] = besselI0(math.Pi * alpha * math.Sqrt(1-x*x))
 	}
-	scale := 1.0 / (denom + 1.0)
+	var total float64
+	for _, v := range kernel {
+		total += v
+	}
 
 	halfWin := make([]float64, half)
-	var sum float64
-	i := 0
-	for ; i <= half/2; i++ {
-		sum += temp[i]
-		if i < half {
-			halfWin[i] = math.Sqrt(sum * scale)
-		}
-	}
-	for ; i < half; i++ {
-		sum += temp[half-i]
-		halfWin[i] = math.Sqrt(sum * scale)
+	var running float64
+	for i := 0; i < half; i++ {
+		running += kernel[i]
+		halfWin[i] = math.Sqrt(running / total)
 	}
 
 	w := make([]float64, n)
