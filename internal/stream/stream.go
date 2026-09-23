@@ -96,10 +96,12 @@ func (s *Stream) Format() pcm.Format {
 	return s.format
 }
 
-// Announce accepts the SDP media description and derives the PCM format.
-func (s *Stream) Announce(m *sdp.Media) error {
+// MediaFormat derives the PCM output format for an announced media
+// description. It mirrors the derivation performed by Announce and lets callers
+// open a matching sink before constructing a stream.
+func MediaFormat(m *sdp.Media) (pcm.Format, error) {
 	if m == nil {
-		return errors.New("stream: nil media")
+		return pcm.Format{}, errors.New("stream: nil media")
 	}
 	rate, channels := 0, 0
 	switch m.Encoding {
@@ -107,14 +109,23 @@ func (s *Stream) Announce(m *sdp.Media) error {
 		rate, channels = m.ClockRate, m.Channels
 	case "AppleLossless":
 		if m.ALAC == nil {
-			return fmt.Errorf("stream: %w: AppleLossless without fmtp", ErrUnsupported)
+			return pcm.Format{}, fmt.Errorf("stream: %w: AppleLossless without fmtp", ErrUnsupported)
 		}
 		rate, channels = m.ALAC.SampleRate, m.ALAC.Channels
 	default:
-		return fmt.Errorf("stream: %w: %s", ErrUnsupported, m.Encoding)
+		return pcm.Format{}, fmt.Errorf("stream: %w: %s", ErrUnsupported, m.Encoding)
 	}
 	format := pcm.Format{Rate: rate, Channels: channels, Format: pcm.S16LE}
 	if err := format.Valid(); err != nil {
+		return pcm.Format{}, err
+	}
+	return format, nil
+}
+
+// Announce accepts the SDP media description and derives the PCM format.
+func (s *Stream) Announce(m *sdp.Media) error {
+	format, err := MediaFormat(m)
+	if err != nil {
 		return err
 	}
 
