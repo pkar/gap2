@@ -94,3 +94,71 @@ func TestParseErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestParseAACPayloadSingle(t *testing.T) {
+	// One AU of 24 bits (3 bytes), index 0.
+	p := []byte{
+		0x00, 0x10, // AU-headers-length = 16 bits
+		0x00, 0xc0, // size = 24 bits, index = 0
+		0xaa, 0xbb, 0xcc,
+	}
+	aus, err := ParseAACPayload(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(aus) != 1 {
+		t.Fatalf("got %d AUs, want 1", len(aus))
+	}
+	if aus[0].SizeBits != 24 || aus[0].Index != 0 {
+		t.Fatalf("au = %+v", aus[0])
+	}
+	if !bytes.Equal(aus[0].Data, []byte{0xaa, 0xbb, 0xcc}) {
+		t.Fatalf("data = %x", aus[0].Data)
+	}
+}
+
+func TestParseAACPayloadMultiple(t *testing.T) {
+	// Two AUs: 24 bits (3 bytes) and 16 bits (2 bytes).
+	p := []byte{
+		0x00, 0x20, // AU-headers-length = 32 bits
+		0x00, 0xc0, // 24 bits, index 0
+		0x00, 0x81, // 16 bits, index 1
+		0xaa, 0xbb, 0xcc,
+		0xdd, 0xee,
+	}
+	aus, err := ParseAACPayload(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(aus) != 2 {
+		t.Fatalf("got %d AUs, want 2", len(aus))
+	}
+	if aus[1].SizeBits != 16 || aus[1].Index != 1 {
+		t.Fatalf("second au = %+v", aus[1])
+	}
+	if !bytes.Equal(aus[1].Data, []byte{0xdd, 0xee}) {
+		t.Fatalf("second data = %x", aus[1].Data)
+	}
+}
+
+func TestParseAACPayloadErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		p    []byte
+		want error
+	}{
+		{"empty", nil, ErrAACShort},
+		{"one byte", []byte{0x00}, ErrAACShort},
+		{"odd header length", []byte{0x00, 0x08, 0x00, 0x00}, ErrAACHeaderLength},
+		{"header too large", []byte{0x00, 0x20, 0x00}, ErrAACShort},
+		{"au overruns", []byte{0x00, 0x10, 0x00, 0xff, 0xaa}, ErrAACShort},
+		{"trailing bytes", []byte{0x00, 0x10, 0x00, 0x08, 0xaa, 0xbb}, ErrAACShort},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ParseAACPayload(tc.p); !errors.Is(err, tc.want) {
+				t.Fatalf("ParseAACPayload = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
