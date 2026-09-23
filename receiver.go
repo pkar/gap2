@@ -3,6 +3,7 @@ package airplay2
 import (
 	"context"
 	"log/slog"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,6 +37,7 @@ type Receiver struct {
 	sessionCount int
 	closed       bool
 	eventsClosed bool
+	ln           net.Listener
 
 	droppedEvents atomic.Int64
 }
@@ -55,9 +57,9 @@ func New(cfg Config) (*Receiver, error) {
 	}, nil
 }
 
-// Run starts the receiver and blocks until ctx is cancelled or an
-// unrecoverable error occurs. A nil return value means clean shutdown.
-func (r *Receiver) Run(ctx context.Context) error {
+// Run starts the receiver and blocks until ctx is cancelled, Close is called,
+// or an unrecoverable error occurs. A nil return value means clean shutdown.
+func (r *Receiver) Run(ctx context.Context) (err error) {
 	if r.runOnce.Swap(true) {
 		return ErrAlreadyRunning
 	}
@@ -70,11 +72,53 @@ func (r *Receiver) Run(ctx context.Context) error {
 	r.setStateLocked(StateStarting)
 	r.mu.Unlock()
 
-	defer r.finish(StateStopped)
+	defer func() {
+		r.mu.Lock()
+		if r.ln != nil {
+			_ = r.ln.Close()
+			r.ln = nil
+		}
+		r.mu.Unlock()
+		if err != nil {
+			r.mu.Lock()
+			r.setStateLocked(StateFailed)
+			r.mu.Unlock()
+			r.closeEvents()
+			return
+		}
+		r.finish(StateStopped)
+	}()
 
-	// Phase 1: discovery, pairing, media transport, and playback are not
-	// implemented yet. Report that honestly rather than idling silently.
-	return ErrNotImplemented
+	store, err := loadPairingStore(r.cfg.PairingsPath)
+	if err != nil {
+		return err
+	}
+	identity, err := store.ensureIdentity(nil)
+	if err != nil {
+		return err
+	}
+
+	ln, err := net.Listen("tcp", r.cfg.ListenAddr)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.ln = ln
+	r.mu.Unlock()
+
+	s := newControlServer(r.cfg, identity, store)
+
+	r.mu.Lock()
+	r.setStateLocked(StateRunning)
+	r.mu.Unlock()
+
+	stopAfter := context.AfterFunc(ctx, func() { _ = ln.Close() })
+	defer stopAfter()
+
+	if err := s.serve(ctx, ln); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Events returns the receiver's notification channel. It is closed when the
@@ -82,6 +126,17 @@ func (r *Receiver) Run(ctx context.Context) error {
 // dropped events are counted in Status.
 func (r *Receiver) Events() <-chan Event {
 	return r.events
+}
+
+// Addr returns the bound control address. It is nil before Run binds the
+// listener and after shutdown.
+func (r *Receiver) Addr() net.Addr {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ln == nil {
+		return nil
+	}
+	return r.ln.Addr()
 }
 
 // Status returns a stable snapshot of the receiver.
@@ -96,13 +151,16 @@ func (r *Receiver) Status() Status {
 	}
 }
 
-// Close shuts the receiver down and is idempotent. In this phase there are no
-// owned goroutines to join, so callers cancel the context passed to Run to
-// stop an active Run.
+// Close shuts the receiver down and is idempotent. It closes the listener
+// backing an active Run, causing Run to return nil. Callers may also cancel
+// the context passed to Run.
 func (r *Receiver) Close() error {
 	r.mu.Lock()
 	if !r.closed {
 		r.closed = true
+		if r.ln != nil {
+			_ = r.ln.Close()
+		}
 		if r.state == StateIdle || r.state == StateStarting {
 			r.setStateLocked(StateStopped)
 		}

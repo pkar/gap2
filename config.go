@@ -29,6 +29,15 @@ type Config struct {
 	// nil for a discovery/control-only receiver.
 	Output pcm.Factory
 
+	// PairingsPath is the file used to persist the accessory identity and
+	// controller pairings. Empty means pairings are in-memory only and do not
+	// survive restarts.
+	PairingsPath string
+
+	// PIN is the numeric pairing setup code used for Pair Setup. Empty means
+	// "3939".
+	PIN string
+
 	// Logger receives structured diagnostics. Nil means slog.Default.
 	Logger *slog.Logger
 
@@ -77,6 +86,9 @@ func (c Config) normalized() Config {
 	}
 	if c.ListenAddr == "" {
 		c.ListenAddr = ":7000"
+	}
+	if c.PIN == "" {
+		c.PIN = "3939"
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()

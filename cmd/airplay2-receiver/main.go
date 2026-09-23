@@ -58,6 +58,8 @@ func run(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	name := fs.String("name", "AirPlay2 Receiver", "advertised receiver name")
 	listen := fs.String("listen", ":7000", "control TCP listen address")
+	pin := fs.String("pin", "3939", "numeric pairing setup code")
+	pairings := fs.String("pairings", "", "JSON file for persistent pairings (empty = in-memory)")
 	var ifaces stringSlice
 	fs.Var(&ifaces, "interface", "network interface (repeatable)")
 	fs.Usage = func() {
@@ -67,9 +69,11 @@ func run(args []string) {
 	_ = fs.Parse(args)
 
 	cfg := airplay2.Config{
-		Name:       *name,
-		ListenAddr: *listen,
-		Interfaces: ifaces,
+		Name:         *name,
+		ListenAddr:   *listen,
+		Interfaces:   ifaces,
+		PIN:          *pin,
+		PairingsPath: *pairings,
 	}
 
 	r, err := airplay2.New(cfg)
