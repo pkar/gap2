@@ -204,6 +204,7 @@ func (h *mediaHandler) announce(cs *connState, req *ctlRequest) error {
 	var out pcm.Sink = h.gain
 	if h.clock != nil {
 		h.playout = playout.NewSynced(h.gain, h.clock.FrameLocalTime, ptp.MonotonicNanos)
+		h.playout.SetOffset(h.cfg.OutputOffset)
 		out = h.playout
 	}
 
@@ -459,6 +460,7 @@ func (h *mediaHandler) openNativeStream(entry *plist.Value) error {
 	var out pcm.Sink = h.gain
 	if h.clock != nil {
 		h.playout = playout.NewSynced(h.gain, h.clock.FrameLocalTime, ptp.MonotonicNanos)
+		h.playout.SetOffset(h.cfg.OutputOffset)
 		out = h.playout
 	}
 	sess, err := media.NewSession("ap2", m, out)
@@ -505,6 +507,10 @@ func (h *mediaHandler) openNativeStream(entry *plist.Value) error {
 					}
 					h.log.Debug("AP2 audio progress", "durationSeconds", time.Since(started).Seconds(), "packets", frames, "rtpSpan", uint32(frame-firstFrame),
 						"playedFrames", position.Frames, "queueMs", position.Latency.Milliseconds(), "underruns", position.Underruns, "leadMs", lead)
+					if h.playout != nil {
+						padding, trimming, skew := h.playout.Correction()
+						h.log.Debug("AP2 output alignment", "paddingMs", padding.Milliseconds(), "trimmingMs", trimming.Milliseconds(), "skewUs", skew.Microseconds())
+					}
 				}
 			}
 			return plain, nil

@@ -139,6 +139,13 @@ available for sender reconnection and drops stale decode/output state. The
 sender still needs to reconnect or select the receiver again after a full
 control-session loss; gap2 cannot force Apple TV to reselect its output.
 
+Synchronized hardware playback aligns each block with the measured output
+queue, padding early audio or trimming late audio outside a 2 ms tolerance.
+For a downstream amplifier or speaker with additional delay, `-output-offset`
+accepts a duration between `-500ms` and `500ms`: negative plays earlier and
+positive plays later. Start at zero and calibrate at the listening position.
+Keep device-specific calibration values in external configuration.
+
 Debug progress logs include stream duration, played frames, queue latency,
 underruns, and timing lead. Stream shutdown emits a summary at info level.
 To summarize a single-receiver, uninterrupted listening interval locally on

@@ -26,9 +26,32 @@ type Synced struct {
 	mu         sync.Mutex
 	paused     atomic.Bool
 	generation atomic.Uint64
+	offset     atomic.Int64
+	padded     atomic.Int64
+	trimmed    atomic.Int64
+	skew       atomic.Int64
 	sink       pcm.Sink
 	mapFrame   func(frame uint32) (uint64, bool)
 	now        func() uint64
+}
+
+// SetOffset shifts presentation deadlines. Positive values play later;
+// negative values compensate for latency downstream of the PCM device.
+func (s *Synced) SetOffset(offset time.Duration) { s.offset.Store(int64(offset)) }
+
+// Correction reports cumulative inserted/removed time and the last observed
+// difference between the presentation deadline and the hardware queue tail.
+func (s *Synced) Correction() (padding, trimming, skew time.Duration) {
+	return time.Duration(s.padded.Load()), time.Duration(s.trimmed.Load()), time.Duration(s.skew.Load())
+}
+
+func (s *Synced) deadline(frame uint32) (uint64, bool) {
+	d, ok := s.mapFrame(frame)
+	offset := s.offset.Load()
+	if offset < 0 && d < uint64(-offset) {
+		return 0, ok
+	}
+	return uint64(int64(d) + offset), ok
 }
 
 // NewSynced returns a Synced that schedules writes onto sink. A nil mapFrame
@@ -58,7 +81,7 @@ func (s *Synced) WriteTimed(ctx context.Context, frame uint32, block pcm.Block) 
 		if s.paused.Load() || generation != s.generation.Load() {
 			return nil
 		}
-		deadline, ok := s.mapFrame(frame)
+		deadline, ok := s.deadline(frame)
 		if !ok {
 			break
 		}
@@ -95,6 +118,42 @@ func (s *Synced) WriteTimed(ctx context.Context, frame uint32, block pcm.Block) 
 	defer s.mu.Unlock()
 	if s.paused.Load() || generation != s.generation.Load() {
 		return nil
+	}
+	// Queuing early alone does not establish the presentation time: the
+	// device may already contain audio, or may start with an empty queue.
+	// Align the queue's tail to this block's deadline. Keep a small deadband
+	// for device-position quantization instead of chasing every observation.
+	if due, ok := s.deadline(frame); ok && block.Format.Rate > 0 {
+		p := s.sink.Position()
+		if p.Timed {
+			errorNs := int64(due) - int64(s.now()) - int64(p.Latency)
+			s.skew.Store(errorNs)
+			const tolerance = int64(2 * time.Millisecond)
+			if errorNs > tolerance {
+				// Bound padding if an anchor changed after the scheduling wait.
+				if errorNs > int64(100*time.Millisecond) {
+					errorNs = int64(100 * time.Millisecond)
+				}
+				frames := int(errorNs * int64(block.Format.Rate) / int64(time.Second))
+				padding, err := pcm.NewBlock(block.Format, frames)
+				if err != nil {
+					return err
+				}
+				if err := s.sink.Write(ctx, padding); err != nil {
+					return err
+				}
+				s.padded.Add(int64(padding.Duration()))
+			} else if errorNs < -tolerance {
+				late := time.Duration(-errorNs)
+				if late >= block.Duration() {
+					s.trimmed.Add(int64(block.Duration()))
+					return nil // This entire block would play after its deadline.
+				}
+				frames := int(int64(late) * int64(block.Format.Rate) / int64(time.Second))
+				s.trimmed.Add(int64(time.Duration(frames) * time.Second / time.Duration(block.Format.Rate)))
+				block.Data = block.Data[frames*block.Format.BytesPerFrame():]
+			}
+		}
 	}
 	return s.sink.Write(ctx, block)
 }

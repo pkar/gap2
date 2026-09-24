@@ -1,6 +1,22 @@
 package airplay2
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+func TestOutputOffsetBounds(t *testing.T) {
+	for _, offset := range []time.Duration{-501 * time.Millisecond, -500 * time.Millisecond, 0, 500 * time.Millisecond, 501 * time.Millisecond} {
+		r, err := New(Config{OutputOffset: offset})
+		valid := offset >= -500*time.Millisecond && offset <= 500*time.Millisecond
+		if (err == nil) != valid {
+			t.Fatalf("offset %s: %v", offset, err)
+		}
+		if r != nil {
+			r.Close()
+		}
+	}
+}
 
 func TestNewDefaults(t *testing.T) {
 	r, err := New(Config{})

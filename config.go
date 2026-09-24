@@ -32,6 +32,9 @@ type Config struct {
 	// initial source format. Subsequent source changes are converted in place.
 	OutputRate     int
 	OutputChannels int
+	// OutputOffset adjusts synchronized playback by up to 500 ms in either
+	// direction. Positive plays later; negative compensates downstream delay.
+	OutputOffset time.Duration
 
 	// PairingsPath is the file used to persist the accessory identity and
 	// controller pairings. Empty means pairings are in-memory only and do not
@@ -130,6 +133,9 @@ func (l Limits) withDefaults() Limits {
 // Validate checks a raw configuration for syntactic validity. It does not
 // perform network or interface I/O.
 func (c Config) Validate() error {
+	if c.OutputOffset < -500*time.Millisecond || c.OutputOffset > 500*time.Millisecond {
+		return fmt.Errorf("%w: output offset must be between -500ms and 500ms", ErrNotConfigured)
+	}
 	if c.OutputRate != 0 && (c.OutputRate < 8000 || c.OutputRate > 192000) {
 		return fmt.Errorf("%w: output rate must be 8000 through 192000", ErrNotConfigured)
 	}

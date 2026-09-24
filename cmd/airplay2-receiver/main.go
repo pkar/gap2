@@ -77,6 +77,7 @@ func run(args []string) {
 	device := fs.String("audio-device", "", "Linux ALSA playback device path")
 	outputRate := fs.Int("output-rate", 0, "fixed output sample rate (0 = initial source rate)")
 	outputChannels := fs.Int("output-channels", 0, "fixed output channels, 1 through 8 (0 = initial source)")
+	outputOffset := fs.Duration("output-offset", 0, "playback offset from -500ms to 500ms (positive later, negative earlier)")
 	debug := fs.Bool("debug", false, "enable debug logging")
 	var ifaces stringSlice
 	fs.Var(&ifaces, "interface", "network interface (repeatable)")
@@ -123,6 +124,7 @@ func run(args []string) {
 		Output:         out,
 		OutputRate:     *outputRate,
 		OutputChannels: *outputChannels,
+		OutputOffset:   *outputOffset,
 	}
 	if *debug {
 		cfg.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
