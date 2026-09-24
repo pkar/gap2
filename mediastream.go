@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/pkar/gap2/internal/hap"
 	"github.com/pkar/gap2/internal/media"
@@ -39,6 +40,7 @@ type mediaHandler struct {
 	recordRequested bool
 	mediaStarted    bool
 	mediaCancel     context.CancelFunc
+	mediaStartedAt  time.Time
 	streamType      int64
 
 	// info supplies the receiver info dictionary pushed as the event-channel
@@ -104,6 +106,11 @@ func (h *mediaHandler) closeAudio() {
 		h.sess = nil
 	}
 	if h.sink != nil {
+		if !h.mediaStartedAt.IsZero() {
+			p := h.sink.Position()
+			h.log.Info("audio stream summary", "durationSeconds", time.Since(h.mediaStartedAt).Seconds(), "playedFrames", p.Frames, "underruns", p.Underruns)
+			h.mediaStartedAt = time.Time{}
+		}
 		_ = h.sink.Close()
 		h.sink = nil
 	}
@@ -183,7 +190,7 @@ func (h *mediaHandler) announce(cs *connState, req *ctlRequest) error {
 		h.log.Debug("media codec rejected", "err", err)
 		return cs.writeRTSPResponse(cseq, 415, "Unsupported Media Type", nil, nil)
 	}
-	sink, err := h.cfg.Output.Open(h.ctx, format)
+	sink, err := h.openOutput(format)
 	if err != nil {
 		h.log.Debug("media sink open failed", "err", err)
 		return cs.writeRTSPResponse(cseq, 500, "Internal Server Error", nil, nil)
@@ -378,7 +385,7 @@ func (h *mediaHandler) setupStreamAp2(cs *connState, cseq string, s *ap2SetupReq
 	// consumed rather than accumulating in the socket buffer. The conn and
 	// sample rate are passed explicitly (rather than read from h.controlConn /
 	// h.sess) to avoid racing with close() and teardown.
-	go h.serveControl(cconn, h.sess.Stream().Format().Rate)
+	go h.serveControl(cconn, h.sess.Stream())
 
 	body, err := buildAp2StreamResponse(stype, uint16(dataPort), controlPort, bufferSize)
 	if err != nil {
@@ -404,7 +411,7 @@ func (h *mediaHandler) openNativeStream(entry *plist.Value) error {
 	ct, rate, channels, frames := integer("ct", 2), integer("sr", 44100), integer("ch", 2), integer("spf", 352)
 	h.log.Debug("AP2 audio format", "type", integer("type", 0), "ct", ct, "rate", rate,
 		"channels", channels, "frames", frames, "audioFormat", integer("audioFormat", 0))
-	if (ct != 2 && ct != 4) || (rate != 44100 && rate != 48000) || channels != 2 || frames <= 0 || frames > 4096 {
+	if (ct != 2 && ct != 4) || rate < 8000 || rate > 192000 || channels < 1 || channels > 8 || (ct == 4 && channels == 7) || frames <= 0 || frames > 4096 {
 		return fmt.Errorf("unsupported AP2 audio format")
 	}
 	key, ok := entry.Dict["shk"]
@@ -419,15 +426,24 @@ func (h *mediaHandler) openNativeStream(entry *plist.Value) error {
 		return fmt.Errorf("no PCM output configured")
 	}
 	m := &sdp.Media{PayloadType: 96, Encoding: "AppleLossless", ClockRate: rate, Channels: channels,
-		ALAC: &sdp.ALACConfig{FrameLength: frames, BitDepth: 16, PB: 40, MB: 10, KB: 14, Channels: channels, SampleRate: rate}}
+		ALAC: &sdp.ALACConfig{FrameLength: frames, BitDepth: integer("ss", 16), PB: 40, MB: 10, KB: 14, Channels: channels, SampleRate: rate}}
 	if ct == 4 {
 		// AAC-LC, stereo, 1024 samples per access unit. Native AP2 sends
 		// raw access units without RFC 3640 AU headers.
-		index := 4 // 44.1 kHz
-		if rate == 48000 {
-			index = 3
+		index := -1
+		for i, r := range []int{96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350} {
+			if r == rate {
+				index = i
+			}
 		}
-		asc := uint16(2<<11 | index<<7 | channels<<3)
+		if index < 0 {
+			return fmt.Errorf("unsupported AAC sample rate %d", rate)
+		}
+		channelConfig := channels
+		if channels == 8 {
+			channelConfig = 12
+		}
+		asc := uint16(2<<11 | index<<7 | channelConfig<<3)
 		m.Encoding, m.ALAC = "AAC", nil
 		m.AAC = &sdp.AACConfig{ASC: []byte{byte(asc >> 8), byte(asc)}}
 	}
@@ -435,7 +451,7 @@ func (h *mediaHandler) openNativeStream(entry *plist.Value) error {
 	if err != nil {
 		return err
 	}
-	sink, err := h.cfg.Output.Open(h.ctx, format)
+	sink, err := h.openOutput(format)
 	if err != nil {
 		return err
 	}
@@ -454,11 +470,13 @@ func (h *mediaHandler) openNativeStream(entry *plist.Value) error {
 		return err
 	}
 	sess.SetPacketDecoder(decryptor.Open)
+	sess.SetRecoveryHandler(func(err error) { h.log.Info("audio transport disconnected; waiting for reconnect", "err", err) })
 	if integer("type", 0) == ap2StreamBuffered {
 		var previousFormat uint32
 		var first bool
 		var firstFrame uint32
 		var frames, lastReport uint64
+		started := time.Now()
 		sess.SetPacketDecoder(func(packet []byte) ([]byte, error) {
 			plain, err := decryptor.OpenBuffered(packet)
 			if err != nil {
@@ -485,7 +503,7 @@ func (h *mediaHandler) openNativeStream(entry *plist.Value) error {
 							lead = (int64(due) - int64(now)) / 1_000_000
 						}
 					}
-					h.log.Debug("AP2 audio progress", "packets", frames, "rtpSpan", uint32(frame-firstFrame),
+					h.log.Debug("AP2 audio progress", "durationSeconds", time.Since(started).Seconds(), "packets", frames, "rtpSpan", uint32(frame-firstFrame),
 						"playedFrames", position.Frames, "queueMs", position.Latency.Milliseconds(), "underruns", position.Underruns, "leadMs", lead)
 				}
 			}
@@ -493,10 +511,36 @@ func (h *mediaHandler) openNativeStream(entry *plist.Value) error {
 		})
 	}
 	h.sink, h.sess = h.gain, sess
+	sess.Stream().SetFormatHandler(func(frame uint32, format pcm.Format) {
+		if h.clock != nil {
+			h.clock.ChangeRate(frame, format.Rate)
+		}
+		h.log.Info("audio format changed", "format", format)
+	})
 	if h.clock != nil {
 		h.clock.ClearAnchor()
 	}
 	return nil
+}
+
+func (h *mediaHandler) openOutput(input pcm.Format) (pcm.Sink, error) {
+	output := input
+	if h.cfg.OutputRate != 0 {
+		output.Rate = h.cfg.OutputRate
+	}
+	if h.cfg.OutputChannels != 0 {
+		output.Channels = h.cfg.OutputChannels
+	}
+	sink, err := h.cfg.Output.Open(h.ctx, output)
+	if err != nil {
+		return nil, err
+	}
+	converted, err := pcm.NewConverter(sink, output)
+	if err != nil {
+		_ = sink.Close()
+		return nil, err
+	}
+	return converted, nil
 }
 
 // ap2TimingSyncCode is the AP2 control-port packet type (code 215) the sender
@@ -510,7 +554,7 @@ const ap2TimingSyncCode = 215
 // time mapping) to this port; rate is the negotiated sample rate used to
 // complete the anchor. Other packet types (resent audio, resend requests) are
 // ignored by this receiver.
-func (h *mediaHandler) serveControl(conn net.PacketConn, rate int) {
+func (h *mediaHandler) serveControl(conn net.PacketConn, source *stream.Stream) {
 	if conn == nil {
 		return
 	}
@@ -520,7 +564,7 @@ func (h *mediaHandler) serveControl(conn net.PacketConn, rate int) {
 		if err != nil {
 			return
 		}
-		h.handleControlPacket(buf[:n], rate)
+		h.handleControlPacket(buf[:n], source.Format().Rate)
 	}
 }
 
@@ -626,6 +670,7 @@ func (h *mediaHandler) startMedia() error {
 		return err
 	}
 	h.mediaStarted = true
+	h.mediaStartedAt = time.Now()
 	sess := h.sess
 	ctx, cancel := context.WithCancel(h.ctx)
 	h.mediaCancel = cancel

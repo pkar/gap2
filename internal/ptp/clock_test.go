@@ -2,6 +2,22 @@ package ptp
 
 import "testing"
 
+func TestChangeRatePreservesPresentationTime(t *testing.T) {
+	c := NewClock()
+	c.SetAnchor(Anchor{Frame: 1000, MasterNs: 5_000_000_000, Rate: 44100})
+	c.ChangeRate(45100, 48000)
+	a, ok := c.Anchor()
+	if !ok {
+		t.Fatal("lost anchor")
+	}
+	if got, _ := a.MasterTime(45100); got != 6_000_000_000 {
+		t.Fatalf("transition moved to %d", got)
+	}
+	if got, _ := a.MasterTime(93100); got != 7_000_000_000 {
+		t.Fatalf("new rate not applied: %d", got)
+	}
+}
+
 func TestClockUsesMatchingSyncReceiveTime(t *testing.T) {
 	c := NewClock()
 	h := Header{ClockID: [8]byte{1}, SourcePort: 2, Sequence: 3, CorrectionNs: 100}

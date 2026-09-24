@@ -2,6 +2,7 @@ package airplay2
 
 import (
 	"context"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -12,6 +13,43 @@ type pipeListener struct {
 	connection chan net.Conn
 	closed     chan struct{}
 	once       sync.Once
+}
+
+func TestControlRecoversAfterStalledHeaders(t *testing.T) {
+	s := newTestControlServer(t)
+	s.cfg.Limits.MaxConnections = 1
+	s.cfg.Limits.ReadHeaderTimeout = 15 * time.Millisecond
+	l := &pipeListener{connection: make(chan net.Conn), closed: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.serve(ctx, l) }()
+	for i := 0; i < 20; i++ {
+		server, client := net.Pipe()
+		l.connection <- server
+		client.SetDeadline(time.Now().Add(time.Second))
+		if _, err := io.WriteString(client, "OPTIONS * RTSP/1.0\r\nCSeq:"); err != nil {
+			t.Fatal(err)
+		}
+		var b [1]byte
+		if _, err := client.Read(b[:]); err == nil {
+			t.Fatal("partial request was accepted")
+		}
+		client.Close()
+		server, client = net.Pipe()
+		l.connection <- server
+		client.SetDeadline(time.Now().Add(time.Second))
+		if response := exchange(t, client, "OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n"); statusCode(response.status) != "200" {
+			t.Fatal(response.status)
+		}
+		client.Close()
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("control shutdown hung")
+	}
 }
 
 func (l *pipeListener) Accept() (net.Conn, error) {

@@ -12,7 +12,7 @@ import (
 //
 //	-ac 2 -c:a aac -b:a 128k -f adts stereo-44100.aac
 func TestIndependentStereoAAC(t *testing.T) {
-	for _, name := range []string{"stereo-44100", "noise-44100"} {
+	for _, name := range []string{"stereo-44100", "noise-44100", "surround-48000", "surround71-48000"} {
 		t.Run(name, func(t *testing.T) { compareIndependentAAC(t, name) })
 	}
 }
@@ -22,7 +22,14 @@ func compareIndependentAAC(t *testing.T, name string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, err := NewDecoder(ASC{ObjectType: 2, SamplingFrequency: 44100, ChannelConfiguration: 2})
+	header, err := ParseHeader(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name == "surround71-48000" {
+		header.ChannelConfig = 12
+	}
+	d, err := NewDecoder(ASC{ObjectType: 2, SamplingFrequency: header.SamplingFrequency, ChannelConfiguration: header.ChannelConfig})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,6 +67,19 @@ func compareIndependentAAC(t *testing.T, name string) {
 	snr := 10 * math.Log10(signal/noise)
 	t.Logf("reference SNR %.2f dB, amplitude ratio %.5f", snr, math.Sqrt(output/signal))
 	if snr < 30 {
+		for a := 0; a < d.channels; a++ {
+			best, bestScore := -1, 0.0
+			for b := 0; b < d.channels; b++ {
+				score := 0.0
+				for i := 0; i < len(decoded)/(2*d.channels); i++ {
+					score += float64(int16(binary.LittleEndian.Uint16(decoded[2*(i*d.channels+a):]))) * float64(int16(binary.LittleEndian.Uint16(reference[2*(i*d.channels+b):])))
+				}
+				if score > bestScore {
+					best, bestScore = b, score
+				}
+			}
+			t.Logf("output channel %d matches reference %d", a, best)
+		}
 		t.Fatalf("PCM differs from independent decoder: %.2f dB SNR", snr)
 	}
 }

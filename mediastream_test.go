@@ -13,6 +13,7 @@ import (
 
 	"github.com/pkar/gap2/internal/plist"
 	"github.com/pkar/gap2/internal/ptp"
+	"github.com/pkar/gap2/internal/stream"
 	"github.com/pkar/gap2/pcm"
 )
 
@@ -179,8 +180,7 @@ func TestMediaAnnounceRejectsCodec(t *testing.T) {
 	buf := &bytes.Buffer{}
 	cs := &connState{log: s.log, w: buf}
 
-	// 24-bit ALAC: the SDP parses and the format derives, but the ALAC decoder
-	// only supports 16-bit, so ANNOUNCE must fail without opening output.
+	// 32-bit ALAC is unsupported; fail without opening output.
 	body := "v=0\r\n" +
 		"o=iTunes 3413825038 0 IN IP4 192.168.1.2\r\n" +
 		"s=iTunes\r\n" +
@@ -188,7 +188,7 @@ func TestMediaAnnounceRejectsCodec(t *testing.T) {
 		"t=0 0\r\n" +
 		"m=audio 0 RTP/AVP 96\r\n" +
 		"a=rtpmap:96 AppleLossless\r\n" +
-		"a=fmtp:96 352 0 24 40 10 14 2 255 0 0 44100\r\n"
+		"a=fmtp:96 352 0 32 40 10 14 2 255 0 0 44100\r\n"
 
 	if err := s.handleMedia(cs, mediaRequest("ANNOUNCE", "rtsp://host/1", "1", nil, body)); err != nil {
 		t.Fatal(err)
@@ -295,15 +295,18 @@ func TestMediaHandlerAp2Setup(t *testing.T) {
 // TestMediaHandlerAp2SetupRejectsNTP returns 400 for a non-PTP timing setup.
 func TestNativeAP2RecordBeforeStreamSetup(t *testing.T) {
 	for _, tc := range []struct {
-		name                      string
-		streamType, codec, frames int64
-		network                   string
+		name                                string
+		streamType, codec, frames, channels int64
+		network                             string
 	}{
-		{"realtime", 96, 2, 352, "udp4"}, {"buffered", 103, 4, 1024, "tcp4"},
+		{"realtime", 96, 2, 352, 2, "udp4"}, {"buffered", 103, 4, 1024, 2, "tcp4"},
+		{"surround51", 103, 4, 1024, 6, "tcp4"}, {"surround71", 103, 4, 1024, 8, "tcp4"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			factory := &mediaFactory{sink: &mediaRecordingSink{}}
 			s := newTestMediaServer(t, factory)
+			s.cfg.OutputRate = 48000
+			s.cfg.OutputChannels = 2
 			var wire bytes.Buffer
 			cs := &connState{log: s.log, w: &wire}
 			h := newMediaHandler(s.cfg, s.log, s.clock)
@@ -325,7 +328,7 @@ func TestNativeAP2RecordBeforeStreamSetup(t *testing.T) {
 			h.listenControl = func() (net.PacketConn, error) { return &fakePacketConn{addr: &net.UDPAddr{Port: 7001}}, nil }
 			body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
 				"streams": plist.Array(plist.Dict(map[string]*plist.Value{
-					"type": plist.Int(tc.streamType), "ct": plist.Int(tc.codec), "sr": plist.Int(44100), "spf": plist.Int(tc.frames), "shk": plist.Data(make([]byte, 32)),
+					"type": plist.Int(tc.streamType), "ct": plist.Int(tc.codec), "sr": plist.Int(44100), "ch": plist.Int(tc.channels), "spf": plist.Int(tc.frames), "shk": plist.Data(make([]byte, 32)),
 				})),
 			}))
 			if err != nil {
@@ -335,11 +338,14 @@ func TestNativeAP2RecordBeforeStreamSetup(t *testing.T) {
 			if err := h.setup(cs, mediaRequest("SETUP", "rtsp://host/1", "2", nil, string(body))); err != nil {
 				t.Fatal(err)
 			}
+			if factory.sink.format.Rate != 48000 || factory.sink.format.Channels != 2 {
+				t.Fatalf("opened output %v", factory.sink.format)
+			}
 			if !strings.Contains(wire.String(), "200 OK") || !h.mediaStarted {
 				t.Fatal("native stream did not start after SETUP")
 			}
-			if factory.sink.format.Rate != 44100 || factory.sink.format.Channels != 2 {
-				t.Fatalf("wrong format: %+v", factory.sink.format)
+			if h.sess.Stream().Format().Rate != 44100 || h.sess.Stream().Format().Channels != int(tc.channels) {
+				t.Fatalf("wrong source format: %+v", h.sess.Stream().Format())
 			}
 			teardown, err := plist.Encode(plist.Dict(map[string]*plist.Value{
 				"streams": plist.Array(plist.Dict(map[string]*plist.Value{"type": plist.Int(tc.streamType)})),
@@ -543,7 +549,7 @@ func TestServeControlDrains(t *testing.T) {
 	h := &mediaHandler{log: slog.Default()}
 	done := make(chan struct{})
 	go func() {
-		h.serveControl(conn, 44100)
+		h.serveControl(conn, stream.New("test", nil, nil))
 		close(done)
 	}()
 	select {
@@ -559,7 +565,7 @@ func TestServeControlDrains(t *testing.T) {
 // TestServeControlNil is a no-op guard for a nil control socket.
 func TestServeControlNil(t *testing.T) {
 	h := &mediaHandler{log: slog.Default()}
-	h.serveControl(nil, 44100)
+	h.serveControl(nil, nil)
 }
 
 // testClockID is a fixed grandmaster clock identity used in code-215 packets.

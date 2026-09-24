@@ -113,13 +113,14 @@ type Decoder struct {
 	rateIdx  int
 	channels int
 
-	overlap  [2][1024]float64
-	prevWin  [2]int
+	overlap  [8][1024]float64
+	prevWin  [8]int
+	order    []int
 	pnsState uint32
 }
 
 // NewDecoder returns a Decoder for an AudioSpecificConfig. Only AAC-LC with
-// one or two channels is supported.
+// standard mono through 7.1 channel configurations are supported.
 func NewDecoder(asc ASC) (*Decoder, error) {
 	if asc.ObjectType != 2 {
 		return nil, ErrUnsupportedObject
@@ -127,7 +128,13 @@ func NewDecoder(asc ASC) (*Decoder, error) {
 	if asc.SBR {
 		return nil, ErrUnsupported
 	}
-	if asc.ChannelConfiguration != 1 && asc.ChannelConfiguration != 2 {
+	orders := map[int][]int{
+		1: {0}, 2: {0, 1}, 3: {1, 2, 0}, 4: {1, 2, 0, 3},
+		5: {1, 2, 0, 3, 4}, 6: {1, 2, 0, 5, 3, 4},
+		7: {1, 2, 0, 7, 5, 6, 3, 4}, 12: {1, 2, 0, 7, 3, 4, 5, 6},
+	}
+	order, ok := orders[asc.ChannelConfiguration]
+	if !ok || asc.FrameLengthFlag || asc.DependsOnCoreCoder || asc.ExtensionFlag {
 		return nil, ErrUnsupported
 	}
 	idx := samplingIndex(asc.SamplingFrequency)
@@ -137,8 +144,8 @@ func NewDecoder(asc ASC) (*Decoder, error) {
 	return &Decoder{
 		rate:     asc.SamplingFrequency,
 		rateIdx:  idx,
-		channels: asc.ChannelConfiguration,
-		prevWin:  [2]int{shapeSine, shapeSine},
+		channels: len(order),
+		order:    order,
 		pnsState: 0x1f2e3d4c,
 	}, nil
 }
@@ -155,8 +162,8 @@ func samplingIndex(rate int) int {
 
 // Reset clears the filterbank overlap and window history after a seek.
 func (d *Decoder) Reset() {
-	d.overlap = [2][1024]float64{}
-	d.prevWin = [2]int{shapeSine, shapeSine}
+	d.overlap = [8][1024]float64{}
+	d.prevWin = [8]int{}
 }
 
 // Decode decodes one access unit into a 1024-frame interleaved S16LE block.
@@ -213,12 +220,26 @@ func (d *Decoder) Decode(au []byte) (pcm.Block, error) {
 			}
 		case elEND:
 			r.Align()
-			return writeBlock(block, out)
+			if slot != d.channels {
+				return pcm.Block{}, ErrMalformed
+			}
+			return d.writeBlock(block, out)
 		default: // CCE
 			return pcm.Block{}, ErrUnsupported
 		}
 	}
-	return writeBlock(block, out)
+	if slot != d.channels {
+		return pcm.Block{}, ErrMalformed
+	}
+	return d.writeBlock(block, out)
+}
+
+func (d *Decoder) writeBlock(block pcm.Block, out []float64) (pcm.Block, error) {
+	ordered := make([]float64, len(out))
+	for dst, src := range d.order {
+		copy(ordered[dst*1024:(dst+1)*1024], out[src*1024:(src+1)*1024])
+	}
+	return writeBlock(block, ordered)
 }
 
 // writeBlock converts float samples at integer-PCM scale into interleaved

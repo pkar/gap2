@@ -1,5 +1,5 @@
 // Package alac implements an Apple Lossless Audio Codec (ALAC) decoder for the
-// 16-bit mono and stereo streams carried by AirPlay. It decodes one compressed
+// 16/24-bit streams with up to eight channels carried by AirPlay. It decodes one compressed
 // frame at a time into interleaved S16LE PCM.
 //
 // The bitstream layout follows the format reverse-engineered by David
@@ -45,18 +45,18 @@ type Decoder struct {
 }
 
 // NewDecoder validates the ALAC magic cookie and returns a decoder. Only
-// 16-bit mono or stereo is supported.
+// 16/24-bit audio with one through eight channels is supported.
 func NewDecoder(cfg *sdp.ALACConfig) (*Decoder, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("%w: nil config", ErrMalformed)
 	}
-	if cfg.BitDepth != 16 {
+	if cfg.BitDepth != 16 && cfg.BitDepth != 24 {
 		return nil, fmt.Errorf("%w: bit depth %d", ErrUnsupported, cfg.BitDepth)
 	}
-	if cfg.Channels != 1 && cfg.Channels != 2 {
+	if cfg.Channels < 1 || cfg.Channels > 8 {
 		return nil, fmt.Errorf("%w: %d channels", ErrUnsupported, cfg.Channels)
 	}
-	if cfg.FrameLength <= 0 {
+	if cfg.FrameLength <= 0 || cfg.FrameLength > 65536 || cfg.SampleRate <= 0 {
 		return nil, fmt.Errorf("%w: frame length %d", ErrMalformed, cfg.FrameLength)
 	}
 	d := &Decoder{
@@ -132,8 +132,10 @@ func (d *Decoder) Decode(frame []byte) (pcm.Block, error) {
 	}
 	for i := 0; i < nbSamples; i++ {
 		for c := 0; c < d.channels; c++ {
-			v := int16(samples[c][i])
-			off := 2 * (i*d.channels + c)
+			// ALAC element order differs from interleaved speaker order.
+			orders := [8][]int{{0}, {0, 1}, {2, 0, 1}, {2, 0, 1, 3}, {2, 0, 1, 3, 4}, {2, 0, 1, 4, 5, 3}, {2, 0, 1, 4, 5, 6, 3}, {2, 6, 7, 0, 1, 4, 5, 3}}
+			v := int16(samples[c][i] >> (d.bitDepth - 16))
+			off := 2 * (i*d.channels + orders[d.channels-1][c])
 			block.Data[off] = byte(v)
 			block.Data[off+1] = byte(uint16(v) >> 8)
 		}
@@ -160,8 +162,8 @@ func (d *Decoder) decodeElement(r *bitReader, channels int) ([][]int32, int, err
 		return nil, 0, ErrMalformed
 	}
 	extraBits := int(extraBitsRaw << 3)
-	if extraBits != 0 {
-		return nil, 0, fmt.Errorf("%w: %d-bit samples", ErrUnsupported, d.bitDepth)
+	if extraBits >= d.bitDepth {
+		return nil, 0, ErrMalformed
 	}
 	bps := d.bitDepth - extraBits + channels - 1
 	if bps < 1 || bps > 32 {
@@ -258,6 +260,21 @@ func (d *Decoder) decodeElement(r *bitReader, channels int) ([][]int32, int, err
 		}
 	}
 
+	extra := make([][]uint32, channels)
+	for c := range extra {
+		extra[c] = make([]uint32, nbSamples)
+	}
+	if extraBits > 0 {
+		for i := 0; i < nbSamples; i++ {
+			for c := 0; c < channels; c++ {
+				v, err := r.read(extraBits)
+				if err != nil {
+					return nil, 0, err
+				}
+				extra[c][i] = v
+			}
+		}
+	}
 	for c := 0; c < channels; c++ {
 		residuals := make([]int32, nbSamples)
 		effectiveMult := mults[c] * d.riceHistoryMult / 4
@@ -273,6 +290,13 @@ func (d *Decoder) decodeElement(r *bitReader, channels int) ([][]int32, int, err
 
 	if channels == 2 && decorrLeftWeight != 0 {
 		decorrelateStereo(out[0], out[1], int(decorrShift), int(decorrLeftWeight))
+	}
+	if extraBits > 0 {
+		for c := range out {
+			for i := range out[c] {
+				out[c][i] = int32(uint32(out[c][i])<<extraBits | extra[c][i])
+			}
+		}
 	}
 	return out, nbSamples, nil
 }

@@ -128,7 +128,7 @@ func TestNewDecoderRejects(t *testing.T) {
 	if _, err := NewDecoder(ASC{ObjectType: 3, SamplingFrequency: 44100, ChannelConfiguration: 1}); err == nil {
 		t.Fatal("expected error for non-LC object type")
 	}
-	if _, err := NewDecoder(ASC{ObjectType: 2, SamplingFrequency: 44100, ChannelConfiguration: 6}); err == nil {
+	if _, err := NewDecoder(ASC{ObjectType: 2, SamplingFrequency: 44100, ChannelConfiguration: 15}); err == nil {
 		t.Fatal("expected error for unsupported channel configuration")
 	}
 	if _, err := NewDecoder(ASC{ObjectType: 2, SamplingFrequency: 12345, ChannelConfiguration: 2}); err == nil {

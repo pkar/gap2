@@ -1,5 +1,6 @@
 # Build artifacts
 /airplay2-receiver
+/gap2-soak-report
 /embed
 /bin/
 /dist/
@@ -9,6 +10,13 @@
 /state/
 *.db
 *.sqlite
+/deploy/*.env
+/pairings.json
+/validation-local/
+*.log
+*.pcap
+*.pcapng
+*.pcm
 
 # Test coverage
 *.out

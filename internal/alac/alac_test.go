@@ -189,8 +189,8 @@ func TestDecodeCompressedSingleSample(t *testing.T) {
 func TestNewDecoderRejectsUnsupported(t *testing.T) {
 	for _, cfg := range []*sdp.ALACConfig{
 		nil,
-		{BitDepth: 24, Channels: 2, FrameLength: 4096, SampleRate: 44100},
-		{BitDepth: 16, Channels: 6, FrameLength: 4096, SampleRate: 44100},
+		{BitDepth: 32, Channels: 2, FrameLength: 4096, SampleRate: 44100},
+		{BitDepth: 16, Channels: 9, FrameLength: 4096, SampleRate: 44100},
 		{BitDepth: 16, Channels: 2, FrameLength: 0, SampleRate: 44100},
 	} {
 		if _, err := NewDecoder(cfg); err == nil {

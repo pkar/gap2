@@ -16,9 +16,18 @@ counter to handle channel changes that reset audio timestamps.
 
 Linux amd64 and arm64 can play directly through an ALSA hardware device,
 without cgo, libasound, or subprocesses. Other platforms can use a PCM file or
-an application-provided sink. Hardware playback requires the device to accept
-the negotiated sample rate; resampling, multichannel audio, and seamless
-midstream codec changes are not implemented. Lip-sync accuracy and the wider
+an application-provided sink. A streaming, 64-tap polyphase resampler adapts
+source rates to a fixed output rate. Mono through eight-channel audio can be
+preserved or downmixed; 5.1 and 7.1 decoding is checked against independently
+encoded fixtures. ALAC accepts 16/24-bit input and emits 16-bit PCM.
+
+Buffered audio format changes switch decoders without closing the transport
+or output device. Supported format identifiers cover AAC-LC stereo at
+44.1/48 kHz, AAC-LC 5.1/7.1 at 48 kHz, and ALAC stereo at 44.1 kHz/16-bit or
+48 kHz/24-bit. Unsupported identifiers fail explicitly. This is channel-based
+PCM support, not an object-audio/Atmos renderer. HE-AAC, arbitrary AAC program
+configurations, and full-resolution 24-bit output are not implemented.
+Lip-sync accuracy, physical surround-speaker routing, and the wider
 sender/device matrix still require validation.
 
 ## Layout
@@ -80,7 +89,8 @@ Set the pairing-state path and audio device for your own host, then run:
 
 ```sh
 airplay2-receiver run -name "gap2" \
-  -pairings "$GAP2_PAIRINGS_PATH" -audio-device "$GAP2_AUDIO_DEVICE"
+  -pairings "$GAP2_PAIRINGS_PATH" -audio-device "$GAP2_AUDIO_DEVICE" \
+  -output-rate 48000 -output-channels 2
 ```
 
 Use `-output audio.pcm` instead of `-audio-device` to capture raw interleaved
@@ -91,6 +101,59 @@ with membership in `audio` and permission to bind those ports. Adjust its
 interface and device in the external `/etc/gap2/receiver.env` file before
 installing it. Host-specific configuration and validation records belong
 outside this repository.
+
+The device must accept the selected output format. Zero output-rate/channel
+flags preserve the initial source format; subsequent changes are converted
+to that format. Use `-output-channels 6` or `8` with a matching multichannel
+device to preserve surround. PCM uses L,R,C,LFE,BL,BR for 5.1 and adds SL,SR
+for standard 7.1. ALAC eight-channel and AAC configuration 7 use FLC,FRC
+instead of SL,SR; verify the physical device's channel mapping. Stereo downmix
+includes center and surround, excludes LFE, and normalizes to avoid clipping.
+
+## Playback and recovery validation
+
+Run an accelerated replay of 30 minutes of encoded audio, repeatedly switching
+codec, source rate and channel count while checking output continuity and
+retained heap size:
+
+```sh
+GAP2_SOAK_DURATION=30m go test ./internal/stream \
+  -run TestBufferedLongPlayback -v -count=1 -timeout=5m
+```
+
+Set `GAP2_SOAK_REALTIME=1` and a longer test timeout to pace the same test in
+real time. It validates the decode/conversion pipeline; it does not substitute
+for listening or real hardware playback.
+
+Network tests exercise 100 real TCP resets, fragmented/truncated frames,
+reconnects on the same negotiated stream, stalled reads, control-header
+timeouts, and receiver cancellation:
+
+```sh
+GAP2_NETWORK_TEST=1 go test ./internal/media -run 'TestBuffered.*Recovery' -v
+go test -race . ./internal/media ./internal/stream ./internal/ptp ./pcm
+```
+
+After a broken TCP audio connection, the receiver keeps the negotiated port
+available for sender reconnection and drops stale decode/output state. The
+sender still needs to reconnect or select the receiver again after a full
+control-session loss; gap2 cannot force Apple TV to reselect its output.
+
+Debug progress logs include stream duration, played frames, queue latency,
+underruns, and timing lead. Stream shutdown emits a summary at info level.
+To summarize a single-receiver, uninterrupted listening interval locally on
+the receiver host, without saving raw logs:
+
+```sh
+go build ./cmd/gap2-soak-report
+journalctl -u gap2.service --since '10 minutes ago' -o cat --no-pager |
+  ./gap2-soak-report -min-duration 9m
+```
+
+The report ignores startup underruns, then requires advancing hardware frames
+without new underruns, transport disconnects, or progress gaps over 15 seconds.
+It exits unsuccessfully when the observed interval is too short or fails those
+checks. Select an interval after intentional channel changes/reconnections.
 
 ## License
 

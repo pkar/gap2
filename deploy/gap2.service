@@ -12,7 +12,8 @@ StateDirectory=gap2
 StateDirectoryMode=0700
 UMask=0077
 EnvironmentFile=/etc/gap2/receiver.env
-ExecStart=/usr/local/bin/airplay2-receiver run -name gap2 -listen :7000 -pairings /var/lib/gap2/pairings.json -audio-device ${GAP2_AUDIO_DEVICE} -interface ${GAP2_INTERFACE}
+Environment=GAP2_OUTPUT_RATE=48000 GAP2_OUTPUT_CHANNELS=2
+ExecStart=/usr/local/bin/airplay2-receiver run -name gap2 -listen :7000 -pairings /var/lib/gap2/pairings.json -audio-device ${GAP2_AUDIO_DEVICE} -output-rate ${GAP2_OUTPUT_RATE} -output-channels ${GAP2_OUTPUT_CHANNELS} -interface ${GAP2_INTERFACE}
 Restart=on-failure
 RestartSec=3
 AmbientCapabilities=CAP_NET_BIND_SERVICE

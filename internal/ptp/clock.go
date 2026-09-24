@@ -223,6 +223,23 @@ func (c *Clock) ClearAnchor() {
 	c.anchorSet = false
 }
 
+// ChangeRate preserves the transition frame's presentation time when a
+// buffered stream changes its sample clock without replacing its transport.
+func (c *Clock) ChangeRate(frame uint32, rate int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.anchorSet || rate <= 0 || rate == c.anchor.Rate {
+		return
+	}
+	ns, ok := c.anchor.MasterTime(frame)
+	if !ok {
+		return
+	}
+	c.anchor.Frame = frame
+	c.anchor.MasterNs = ns
+	c.anchor.Rate = rate
+}
+
 // Anchor returns the most recent playback anchor and whether one is set.
 func (c *Clock) Anchor() (Anchor, bool) {
 	c.mu.Lock()

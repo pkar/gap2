@@ -75,6 +75,8 @@ func run(args []string) {
 	pairings := fs.String("pairings", "", "JSON file for persistent pairings (empty = in-memory)")
 	output := fs.String("output", "", "write decoded PCM to this file (\"-\" for stdout)")
 	device := fs.String("audio-device", "", "Linux ALSA playback device path")
+	outputRate := fs.Int("output-rate", 0, "fixed output sample rate (0 = initial source rate)")
+	outputChannels := fs.Int("output-channels", 0, "fixed output channels, 1 through 8 (0 = initial source)")
 	debug := fs.Bool("debug", false, "enable debug logging")
 	var ifaces stringSlice
 	fs.Var(&ifaces, "interface", "network interface (repeatable)")
@@ -113,12 +115,14 @@ func run(args []string) {
 	}
 
 	cfg := airplay2.Config{
-		Name:         *name,
-		ListenAddr:   *listen,
-		Interfaces:   ifaces,
-		PIN:          *pin,
-		PairingsPath: *pairings,
-		Output:       out,
+		Name:           *name,
+		ListenAddr:     *listen,
+		Interfaces:     ifaces,
+		PIN:            *pin,
+		PairingsPath:   *pairings,
+		Output:         out,
+		OutputRate:     *outputRate,
+		OutputChannels: *outputChannels,
 	}
 	if *debug {
 		cfg.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))

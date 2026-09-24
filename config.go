@@ -28,6 +28,10 @@ type Config struct {
 	// Output is the PCM sink factory used for each playback stream. It may be
 	// nil for a discovery/control-only receiver.
 	Output pcm.Factory
+	// OutputRate and OutputChannels fix the device format. Zero preserves the
+	// initial source format. Subsequent source changes are converted in place.
+	OutputRate     int
+	OutputChannels int
 
 	// PairingsPath is the file used to persist the accessory identity and
 	// controller pairings. Empty means pairings are in-memory only and do not
@@ -126,6 +130,12 @@ func (l Limits) withDefaults() Limits {
 // Validate checks a raw configuration for syntactic validity. It does not
 // perform network or interface I/O.
 func (c Config) Validate() error {
+	if c.OutputRate != 0 && (c.OutputRate < 8000 || c.OutputRate > 192000) {
+		return fmt.Errorf("%w: output rate must be 8000 through 192000", ErrNotConfigured)
+	}
+	if c.OutputChannels < 0 || c.OutputChannels > 8 {
+		return fmt.Errorf("%w: output channels must be 0 through 8", ErrNotConfigured)
+	}
 	if strings.TrimSpace(c.Name) == "" {
 		return fmt.Errorf("%w: name is empty", ErrNotConfigured)
 	}

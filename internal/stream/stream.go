@@ -92,6 +92,8 @@ type Stream struct {
 	flushFrom       uint32
 	hasFlushFrom    bool
 	flushBySequence bool
+	bufferedFormat  uint32
+	onFormat        func(uint32, pcm.Format)
 }
 
 // New returns a stream that will decode with decoder and write decoded blocks
@@ -208,6 +210,16 @@ func (s *Stream) Teardown() error {
 	return nil
 }
 
+// Recover drops partial decoder/output state after the transport disconnects.
+// Pairing, negotiated format and the recording state survive reconnection.
+func (s *Stream) Recover(ctx context.Context) error {
+	s.mu.Lock()
+	s.resetDecoder = true
+	s.flushActive = false
+	s.mu.Unlock()
+	return s.sink.Flush(ctx)
+}
+
 // FlushRange removes old encoded packets from a seek or channel change.
 // Timestamp comparisons use signed deltas to handle RTP wraparound.
 func (s *Stream) FlushRange(until uint32, from *uint32) {
@@ -237,16 +249,20 @@ func (s *Stream) FlushBufferedRange(until uint32, from *uint32) {
 
 // IngestBufferedRTP retains the sequence bits lost when normalizing to RTP.
 func (s *Stream) IngestBufferedRTP(ctx context.Context, pkt []byte, sequence uint32) error {
-	return s.ingestRTP(ctx, pkt, sequence)
+	return s.ingestRTP(ctx, pkt, sequence, true)
 }
+
+// SetFormatHandler installs a notification before ingest starts. It runs on
+// the decode goroutine, before the first PCM block in the new format.
+func (s *Stream) SetFormatHandler(fn func(uint32, pcm.Format)) { s.onFormat = fn }
 
 // IngestRTP handles one RTP packet: it verifies the payload type, extracts
 // AAC access units, decodes them, and writes the resulting PCM to the sink.
 func (s *Stream) IngestRTP(ctx context.Context, pkt []byte) error {
-	return s.ingestRTP(ctx, pkt, 0)
+	return s.ingestRTP(ctx, pkt, 0, false)
 }
 
-func (s *Stream) ingestRTP(ctx context.Context, pkt []byte, sequence uint32) error {
+func (s *Stream) ingestRTP(ctx context.Context, pkt []byte, sequence uint32, buffered bool) error {
 	s.mu.Lock()
 	state := s.state
 	media := s.media
@@ -283,6 +299,30 @@ func (s *Stream) ingestRTP(ctx context.Context, pkt []byte, sequence uint32) err
 	reset := s.resetDecoder
 	s.resetDecoder = false
 	s.mu.Unlock()
+	if buffered && p.SSRC != 0 && p.SSRC != s.bufferedFormat {
+		m, err := bufferedMedia(p.SSRC)
+		if err != nil {
+			return err
+		}
+		decoder, err := NewDecoder(m)
+		if err != nil {
+			return err
+		}
+		format, err := MediaFormat(m)
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.media = m
+		s.format = format
+		s.mu.Unlock()
+		s.decoder = decoder
+		s.bufferedFormat = p.SSRC
+		media = m
+		if s.onFormat != nil {
+			s.onFormat(p.Timestamp, format)
+		}
+	}
 	if reset {
 		if d, ok := s.decoder.(interface{ Reset() }); ok {
 			d.Reset()

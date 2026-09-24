@@ -99,12 +99,16 @@ type Session struct {
 	tcp          net.Listener
 	tcpConn      net.Conn
 	decodePacket func([]byte) ([]byte, error)
+	onRecovery   func(error)
 }
 
 // SetPacketDecoder installs authenticated packet decryption before Serve.
 func (s *Session) SetPacketDecoder(decode func([]byte) ([]byte, error)) {
 	s.decodePacket = decode
 }
+
+// SetRecoveryHandler installs diagnostics before Serve starts.
+func (s *Session) SetRecoveryHandler(fn func(error)) { s.onRecovery = fn }
 
 // NewSession builds a Session for the announced media, decoding into sink. The
 // stream is left in StateNew until its Announce method is called by the RTSP
@@ -195,6 +199,30 @@ func (s *Session) Close() error {
 func (s *Session) serveBuffered(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, func() { _ = s.tcp.Close() })
 	defer stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := s.serveBufferedConnection(ctx)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		s.mu.Lock()
+		closed := s.closed
+		s.mu.Unlock()
+		if closed || errors.Is(err, net.ErrClosed) {
+			return err
+		}
+		if s.onRecovery != nil {
+			s.onRecovery(err)
+		}
+		if err := s.stream.Recover(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+func (s *Session) serveBufferedConnection(ctx context.Context) error {
 	c, err := s.tcp.Accept()
 	if err != nil {
 		return err
