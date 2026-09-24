@@ -140,8 +140,14 @@ func (s *controlServer) handleInfo(cs *connState) error {
 }
 
 func (s *controlServer) infoPlist() ([]byte, error) {
+	return plist.Encode(s.infoValue())
+}
+
+// infoValue builds the receiver info dictionary shared by the discovery
+// /info endpoint and the AP2 event-channel updateInfo push.
+func (s *controlServer) infoValue() *plist.Value {
 	mac := s.store.deviceID()
-	v := plist.Dict(map[string]*plist.Value{
+	return plist.Dict(map[string]*plist.Value{
 		"deviceid": plist.String(mac),
 		"features": plist.Int(0x5A7FFFF7),
 		"flags":    plist.Int(0x4),
@@ -152,7 +158,6 @@ func (s *controlServer) infoPlist() ([]byte, error) {
 		"srcvers":  plist.String("366.0"),
 		"vv":       plist.Int(2),
 	})
-	return plist.Encode(v)
 }
 
 func (s *controlServer) handlePairSetup(cs *connState, req *ctlRequest) error {
@@ -210,6 +215,11 @@ type connState struct {
 	verify    *hap.PairVerifySession
 	encrypted *hap.Conn
 	media     *mediaHandler
+
+	// sessionKey is the shared secret established by pair setup/verify. It
+	// feeds both the control channel (via hap.Conn) and the AP2 event channel
+	// (via hap.NewEventConn).
+	sessionKey []byte
 }
 
 func (cs *connState) upgrade(sessionKey []byte) error {
@@ -220,6 +230,7 @@ func (cs *connState) upgrade(sessionKey []byte) error {
 	cs.encrypted = ec
 	cs.br = bufio.NewReader(ec)
 	cs.w = ec
+	cs.sessionKey = append(cs.sessionKey[:0], sessionKey...)
 	return nil
 }
 

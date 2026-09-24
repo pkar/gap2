@@ -29,6 +29,10 @@ type mediaHandler struct {
 	sess *media.Session
 	sink pcm.Sink
 
+	// info supplies the receiver info dictionary pushed as the event-channel
+	// updateInfo; it is injected from the control server after pairing.
+	info func() *plist.Value
+
 	// bind is overridable in tests to avoid binding a real socket.
 	bind func(network, addr string) (int, error)
 
@@ -78,6 +82,7 @@ func (h *mediaHandler) close() {
 func (s *controlServer) handleMedia(cs *connState, req *ctlRequest) error {
 	if cs.media == nil {
 		cs.media = newMediaHandler(s.cfg, s.log, s.clock)
+		cs.media.info = s.infoValue
 	}
 	h := cs.media
 
@@ -215,6 +220,13 @@ func (h *mediaHandler) setupInitialAp2(cs *connState, cseq string, s *ap2SetupRe
 	}
 	port := uint16(ln.Addr().(*net.TCPAddr).Port)
 	h.eventLn = ln
+
+	// Start serving the encrypted event channel once the sender connects to
+	// the advertised port. The listener is passed explicitly (rather than read
+	// from h.eventLn) to avoid racing with close() during teardown.
+	if len(cs.sessionKey) > 0 {
+		go h.serveEvent(ln, cs.sessionKey)
+	}
 
 	body, err := buildAp2InitialResponse(port, localIP(cs.conn))
 	if err != nil {

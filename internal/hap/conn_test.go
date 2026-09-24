@@ -5,15 +5,17 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 )
 
 // newControllerConn mirrors NewConn for the controller side of the channel:
-// its outgoing key is the accessory's incoming key and vice versa.
+// its outgoing key is the accessory's incoming key and vice versa. The
+// controller encrypts with the read key and decrypts with the write key.
 func newControllerConn(c net.Conn, shared []byte) *Conn {
 	return &Conn{
 		c:      c,
-		outKey: hkdfSHA512(shared, []byte(controlSalt), []byte(controlWriteInfo), 32),
-		inKey:  hkdfSHA512(shared, []byte(controlSalt), []byte(controlReadInfo), 32),
+		outKey: hkdfSHA512(shared, []byte(controlSalt), []byte(controlReadInfo), 32),
+		inKey:  hkdfSHA512(shared, []byte(controlSalt), []byte(controlWriteInfo), 32),
 	}
 }
 
@@ -107,6 +109,58 @@ func TestConnTamper(t *testing.T) {
 		t.Fatal("expected authentication failure for tampered record")
 	}
 }
+
+// TestKeyDerivation locks in the control- and event-channel salt/info labels
+// and their read/write direction. The accessory must encrypt control data
+// with the write key and decrypt with the read key, while the event channel
+// inverts that: encrypt with the read key and decrypt with the write key.
+func TestKeyDerivation(t *testing.T) {
+	shared := mustHexBytes(t, "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00")
+
+	ctrl := NewConn(discardConn{}, shared)
+	if want := hkdfSHA512(shared, []byte("Control-Salt"), []byte("Control-Write-Encryption-Key"), 32); !bytes.Equal(ctrl.outKey, want) {
+		t.Errorf("control outKey: got %x want %x", ctrl.outKey, want)
+	}
+	if want := hkdfSHA512(shared, []byte("Control-Salt"), []byte("Control-Read-Encryption-Key"), 32); !bytes.Equal(ctrl.inKey, want) {
+		t.Errorf("control inKey: got %x want %x", ctrl.inKey, want)
+	}
+	if bytes.Equal(ctrl.outKey, ctrl.inKey) {
+		t.Fatal("control outKey and inKey must differ")
+	}
+
+	ev := NewEventConn(discardConn{}, shared)
+	if want := hkdfSHA512(shared, []byte("Events-Salt"), []byte("Events-Read-Encryption-Key"), 32); !bytes.Equal(ev.outKey, want) {
+		t.Errorf("event outKey: got %x want %x", ev.outKey, want)
+	}
+	if want := hkdfSHA512(shared, []byte("Events-Salt"), []byte("Events-Write-Encryption-Key"), 32); !bytes.Equal(ev.inKey, want) {
+		t.Errorf("event inKey: got %x want %x", ev.inKey, want)
+	}
+	if bytes.Equal(ev.outKey, ev.inKey) {
+		t.Fatal("event outKey and inKey must differ")
+	}
+
+	// Control and event channels must not share keys with each other.
+	for _, a := range [][]byte{ctrl.outKey, ctrl.inKey} {
+		for _, b := range [][]byte{ev.outKey, ev.inKey} {
+			if bytes.Equal(a, b) {
+				t.Fatal("control and event keys must be distinct")
+			}
+		}
+	}
+}
+
+// discardConn is a net.Conn that never carries data; it is used only to
+// construct Conn values whose key schedule is under test.
+type discardConn struct{}
+
+func (discardConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (discardConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (discardConn) Close() error                     { return nil }
+func (discardConn) LocalAddr() net.Addr              { return nil }
+func (discardConn) RemoteAddr() net.Addr             { return nil }
+func (discardConn) SetDeadline(time.Time) error      { return nil }
+func (discardConn) SetReadDeadline(time.Time) error  { return nil }
+func (discardConn) SetWriteDeadline(time.Time) error { return nil }
 
 func TestRecordNonce(t *testing.T) {
 	want := mustHexBytes(t, "000000000100000000000000")

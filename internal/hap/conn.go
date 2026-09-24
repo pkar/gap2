@@ -8,12 +8,21 @@ import (
 	"time"
 )
 
-// Control-channel key derivation constants. The accessory's outgoing key is
-// the controller's read key, and vice versa.
+// Key-derivation salts and info labels. The control channel follows the HAP
+// convention: "read"/"write" are from the accessory's perspective, so the
+// accessory encrypts outgoing data with the write key and decrypts incoming
+// data with the read key. The event channel inverts the labels relative to
+// the control channel: the accessory encrypts with the read key and decrypts
+// with the write key. Both channels derive their keys from the same shared
+// secret with SHA-512 HKDF.
 const (
 	controlSalt      = "Control-Salt"
 	controlReadInfo  = "Control-Read-Encryption-Key"
 	controlWriteInfo = "Control-Write-Encryption-Key"
+
+	eventSalt      = "Events-Salt"
+	eventReadInfo  = "Events-Read-Encryption-Key"
+	eventWriteInfo = "Events-Write-Encryption-Key"
 )
 
 // HAP encrypted-record framing limits.
@@ -42,14 +51,28 @@ type Conn struct {
 	readErr error
 }
 
-// NewConn wraps c as an accessory-side encrypted HAP connection. sharedKey is
-// the Pair Verify X25519 shared secret or the transient Pair Setup SRP session
-// key.
+// NewConn wraps c as an accessory-side encrypted HAP control connection.
+// sharedKey is the Pair Verify X25519 shared secret or the transient Pair
+// Setup SRP session key.
 func NewConn(c net.Conn, sharedKey []byte) *Conn {
+	return newConn(c, sharedKey, controlSalt, controlWriteInfo, controlReadInfo)
+}
+
+// NewEventConn wraps c as an accessory-side encrypted AirPlay 2 event channel.
+// It derives its keys from the same shared secret as the control channel but
+// with the event-specific salt and info labels, and with the read/write roles
+// inverted as the event-channel spec requires.
+func NewEventConn(c net.Conn, sharedKey []byte) *Conn {
+	return newConn(c, sharedKey, eventSalt, eventReadInfo, eventWriteInfo)
+}
+
+// newConn derives the two directional ChaCha20-Poly1305 keys from sharedKey
+// with the given HKDF salt and info labels and wraps c.
+func newConn(c net.Conn, sharedKey []byte, salt, outInfo, inInfo string) *Conn {
 	return &Conn{
 		c:      c,
-		outKey: hkdfSHA512(sharedKey, []byte(controlSalt), []byte(controlReadInfo), 32),
-		inKey:  hkdfSHA512(sharedKey, []byte(controlSalt), []byte(controlWriteInfo), 32),
+		outKey: hkdfSHA512(sharedKey, []byte(salt), []byte(outInfo), 32),
+		inKey:  hkdfSHA512(sharedKey, []byte(salt), []byte(inInfo), 32),
 	}
 }
 
