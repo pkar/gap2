@@ -2,6 +2,7 @@ package airplay2
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
@@ -287,10 +288,10 @@ func (h *mediaHandler) setupStreamAp2(cs *connState, cseq string, s *ap2SetupReq
 	controlPort := uint16(cconn.LocalAddr().(*net.UDPAddr).Port)
 
 	// Drain the advertised control port so RTCP feedback from the sender is
-	// consumed rather than accumulating in the socket buffer. The conn is
-	// passed explicitly (rather than read from h.controlConn) to avoid racing
-	// with close() during teardown.
-	go h.serveControl(cconn)
+	// consumed rather than accumulating in the socket buffer. The conn and
+	// sample rate are passed explicitly (rather than read from h.controlConn /
+	// h.sess) to avoid racing with close() and teardown.
+	go h.serveControl(cconn, h.sess.Stream().Format().Rate)
 
 	body, err := buildAp2StreamResponse(stype, uint16(dataPort), controlPort, 0)
 	if err != nil {
@@ -300,13 +301,18 @@ func (h *mediaHandler) setupStreamAp2(cs *connState, cseq string, s *ap2SetupReq
 		map[string]string{"Content-Type": "application/x-apple-binary-plist"}, body)
 }
 
-// serveControl drains the AP2 control UDP socket for the life of the stream.
-// The sender posts RTCP feedback (Sender/Receiver Reports carrying RTP-to-NTP
-// timestamp mappings) to this port. Playback is currently anchored from the
-// SETRATEANCHORI PTP rate anchor rather than RTCP feedback, so packets are
-// read and logged instead of being left to fill the socket buffer; decoding
-// the feedback into a playout anchor is a future extension.
-func (h *mediaHandler) serveControl(conn net.PacketConn) {
+// ap2TimingSyncCode is the AP2 control-port packet type (code 215) the sender
+// posts to announce the playback anchor: which RTP frame plays at which
+// grandmaster time. It is an RTP-like datagram whose second byte is the code.
+const ap2TimingSyncCode = 215
+
+// serveControl drains the AP2 control UDP socket for the life of the stream
+// and feeds timing-sync announcements into the clock anchor. The sender posts
+// code-215 anchoring announcements (carrying the RTP frame <-> grandmaster
+// time mapping) to this port; rate is the negotiated sample rate used to
+// complete the anchor. Other packet types (resent audio, resend requests) are
+// ignored by this receiver.
+func (h *mediaHandler) serveControl(conn net.PacketConn, rate int) {
 	if conn == nil {
 		return
 	}
@@ -316,8 +322,43 @@ func (h *mediaHandler) serveControl(conn net.PacketConn) {
 		if err != nil {
 			return
 		}
-		h.log.Debug("AP2 control feedback", "bytes", n)
+		h.handleControlPacket(buf[:n], rate)
 	}
+}
+
+// handleControlPacket processes one AP2 control-port datagram. A code-215
+// timing-sync packet carries the playback anchor (the RTP frame playing at a
+// given grandmaster time) and continuously refreshes the anchor set by
+// SETRATEANCHORI, correcting drift. It is a no-op without a synchronized
+// clock or a positive sample rate.
+func (h *mediaHandler) handleControlPacket(pkt []byte, rate int) {
+	frame, masterNs, ok := ap2ControlAnchor(pkt)
+	if !ok || h.clock == nil || rate <= 0 {
+		return
+	}
+	h.clock.SetAnchor(ptp.Anchor{Frame: frame, MasterNs: masterNs, Rate: rate})
+	h.log.Debug("AP2 control anchor", "frame", frame, "masterNs", masterNs)
+}
+
+// ap2ControlAnchor parses a code-215 anchoring announcement and returns the
+// RTP frame that plays at the given grandmaster time. The packet layout is:
+//
+//	offset 1        packet type code (215 for a timing-sync announcement)
+//	offset 4..8     frame (uint32 BE): the RTP timestamp due to play at the
+//	                packet's timestamp; the sender bakes the 77175-frame
+//	                stream latency into this value.
+//	offset 8..16    masterNs (uint64 BE): the grandmaster time, in
+//	                nanoseconds, at which frame plays.
+//
+// ok is false when the packet is too short or is not a timing-sync packet.
+// The reference additionally subtracts a small output-backend latency fudge
+// factor from frame; gap2's playout scheduler buffers independently, so the
+// sender's value is used directly.
+func ap2ControlAnchor(pkt []byte) (frame uint32, masterNs uint64, ok bool) {
+	if len(pkt) < 16 || pkt[1] != ap2TimingSyncCode {
+		return 0, 0, false
+	}
+	return binary.BigEndian.Uint32(pkt[4:8]), binary.BigEndian.Uint64(pkt[8:16]), true
 }
 
 // localIP returns the local IP of a connection as a string, used to populate

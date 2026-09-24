@@ -3,6 +3,7 @@ package airplay2
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"log/slog"
 	"net"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/pkar/gap2/internal/plist"
+	"github.com/pkar/gap2/internal/ptp"
 	"github.com/pkar/gap2/pcm"
 )
 
@@ -407,7 +409,7 @@ func TestServeControlDrains(t *testing.T) {
 	h := &mediaHandler{log: slog.Default()}
 	done := make(chan struct{})
 	go func() {
-		h.serveControl(conn)
+		h.serveControl(conn, 44100)
 		close(done)
 	}()
 	select {
@@ -423,5 +425,74 @@ func TestServeControlDrains(t *testing.T) {
 // TestServeControlNil is a no-op guard for a nil control socket.
 func TestServeControlNil(t *testing.T) {
 	h := &mediaHandler{log: slog.Default()}
-	h.serveControl(nil)
+	h.serveControl(nil, 44100)
+}
+
+// ap2TimingPacket builds a synthetic code-215 anchoring announcement with the
+// given frame and grandmaster time.
+func ap2TimingPacket(frame uint32, masterNs uint64) []byte {
+	pkt := make([]byte, 28)
+	pkt[1] = ap2TimingSyncCode
+	binary.BigEndian.PutUint32(pkt[4:8], frame)
+	binary.BigEndian.PutUint64(pkt[8:16], masterNs)
+	return pkt
+}
+
+// TestAp2ControlAnchor parses a code-215 packet and checks the extracted
+// frame/grandmaster mapping, plus rejection of short and wrong-type packets.
+func TestAp2ControlAnchor(t *testing.T) {
+	pkt := ap2TimingPacket(0x11223344, 0x8877665544332211)
+	frame, masterNs, ok := ap2ControlAnchor(pkt)
+	if !ok {
+		t.Fatal("ap2ControlAnchor rejected a valid timing-sync packet")
+	}
+	if frame != 0x11223344 || masterNs != 0x8877665544332211 {
+		t.Fatalf("anchor = (%#x, %#x), want (0x11223344, 0x8877665544332211)", frame, masterNs)
+	}
+
+	if _, _, ok := ap2ControlAnchor(nil); ok {
+		t.Fatal("ap2ControlAnchor accepted a nil packet")
+	}
+	short := ap2TimingPacket(1, 2)[:15]
+	if _, _, ok := ap2ControlAnchor(short); ok {
+		t.Fatal("ap2ControlAnchor accepted a short packet")
+	}
+	wrong := ap2TimingPacket(1, 2)
+	wrong[1] = ap2TimingSyncCode + 1
+	if _, _, ok := ap2ControlAnchor(wrong); ok {
+		t.Fatal("ap2ControlAnchor accepted a wrong-type packet")
+	}
+}
+
+// TestHandleControlPacket verifies that a code-215 packet updates the clock
+// anchor.
+func TestHandleControlPacket(t *testing.T) {
+	clock := ptp.NewClock()
+	h := &mediaHandler{log: slog.Default(), clock: clock}
+	h.handleControlPacket(ap2TimingPacket(1000, 5_000_000_000), 44100)
+
+	a, ok := clock.Anchor()
+	if !ok {
+		t.Fatal("anchor not set")
+	}
+	if a.Frame != 1000 || a.MasterNs != 5_000_000_000 || a.Rate != 44100 {
+		t.Fatalf("anchor = %+v, want frame 1000 master 5000000000 rate 44100", a)
+	}
+}
+
+// TestHandleControlPacketNoClock ensures a nil clock is a no-op.
+func TestHandleControlPacketNoClock(t *testing.T) {
+	h := &mediaHandler{log: slog.Default()}
+	h.handleControlPacket(ap2TimingPacket(1000, 5_000_000_000), 44100) // must not panic
+}
+
+// TestHandleControlPacketZeroRate ensures a non-positive rate does not set an
+// anchor.
+func TestHandleControlPacketZeroRate(t *testing.T) {
+	clock := ptp.NewClock()
+	h := &mediaHandler{log: slog.Default(), clock: clock}
+	h.handleControlPacket(ap2TimingPacket(1000, 5_000_000_000), 0)
+	if _, ok := clock.Anchor(); ok {
+		t.Fatal("anchor set for zero rate")
+	}
 }
