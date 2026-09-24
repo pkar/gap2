@@ -3,6 +3,7 @@ package airplay2
 import (
 	"bytes"
 	"context"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -372,4 +373,55 @@ func TestMediaRequiresEncryption(t *testing.T) {
 	if got := buf.String(); !strings.Contains(got, "HTTP/1.1 401") {
 		t.Fatalf("unauthenticated ANNOUNCE response = %q", got)
 	}
+}
+
+// feedbackPacketConn delivers the packets in packets one per ReadFrom call and
+// then returns net.ErrClosed, so a drain loop consumes everything and exits.
+type feedbackPacketConn struct {
+	addr    net.Addr
+	packets [][]byte
+}
+
+func (c *feedbackPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	if len(c.packets) == 0 {
+		return 0, nil, net.ErrClosed
+	}
+	n := copy(b, c.packets[0])
+	c.packets = c.packets[1:]
+	return n, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 6000}, nil
+}
+func (c *feedbackPacketConn) WriteTo(b []byte, a net.Addr) (int, error) { return len(b), nil }
+func (c *feedbackPacketConn) Close() error                              { return nil }
+func (c *feedbackPacketConn) LocalAddr() net.Addr                       { return c.addr }
+func (c *feedbackPacketConn) SetDeadline(time.Time) error               { return nil }
+func (c *feedbackPacketConn) SetReadDeadline(time.Time) error           { return nil }
+func (c *feedbackPacketConn) SetWriteDeadline(time.Time) error          { return nil }
+
+// TestServeControlDrains checks that the control-port drain loop consumes the
+// packets the sender posts and exits once the socket is closed.
+func TestServeControlDrains(t *testing.T) {
+	conn := &feedbackPacketConn{
+		addr:    &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7001},
+		packets: [][]byte{[]byte("pkt0"), []byte("pkt1")},
+	}
+	h := &mediaHandler{log: slog.Default()}
+	done := make(chan struct{})
+	go func() {
+		h.serveControl(conn)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveControl did not exit after draining packets")
+	}
+	if len(conn.packets) != 0 {
+		t.Fatalf("serveControl left %d packets undrained", len(conn.packets))
+	}
+}
+
+// TestServeControlNil is a no-op guard for a nil control socket.
+func TestServeControlNil(t *testing.T) {
+	h := &mediaHandler{log: slog.Default()}
+	h.serveControl(nil)
 }

@@ -286,12 +286,38 @@ func (h *mediaHandler) setupStreamAp2(cs *connState, cseq string, s *ap2SetupReq
 	h.controlConn = cconn
 	controlPort := uint16(cconn.LocalAddr().(*net.UDPAddr).Port)
 
+	// Drain the advertised control port so RTCP feedback from the sender is
+	// consumed rather than accumulating in the socket buffer. The conn is
+	// passed explicitly (rather than read from h.controlConn) to avoid racing
+	// with close() during teardown.
+	go h.serveControl(cconn)
+
 	body, err := buildAp2StreamResponse(stype, uint16(dataPort), controlPort, 0)
 	if err != nil {
 		return cs.writeRTSPResponse(cseq, 500, "Internal Server Error", nil, nil)
 	}
 	return cs.writeRTSPResponse(cseq, 200, "OK",
 		map[string]string{"Content-Type": "application/x-apple-binary-plist"}, body)
+}
+
+// serveControl drains the AP2 control UDP socket for the life of the stream.
+// The sender posts RTCP feedback (Sender/Receiver Reports carrying RTP-to-NTP
+// timestamp mappings) to this port. Playback is currently anchored from the
+// SETRATEANCHORI PTP rate anchor rather than RTCP feedback, so packets are
+// read and logged instead of being left to fill the socket buffer; decoding
+// the feedback into a playout anchor is a future extension.
+func (h *mediaHandler) serveControl(conn net.PacketConn) {
+	if conn == nil {
+		return
+	}
+	buf := make([]byte, 1500)
+	for {
+		n, _, err := conn.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		h.log.Debug("AP2 control feedback", "bytes", n)
+	}
 }
 
 // localIP returns the local IP of a connection as a string, used to populate
