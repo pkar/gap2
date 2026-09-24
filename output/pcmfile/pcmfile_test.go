@@ -54,3 +54,43 @@ func TestCloseIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestCaptureAdoptsFormat ensures the Capture factory writes PCM at whatever
+// format the stream announces, unlike Factory which pins one format.
+func TestCaptureAdoptsFormat(t *testing.T) {
+	var buf bytes.Buffer
+	f := Capture(&buf)
+
+	for _, format := range []pcm.Format{
+		{Rate: 44100, Channels: 2, Format: pcm.S16LE},
+		{Rate: 48000, Channels: 2, Format: pcm.S16LE},
+	} {
+		s, err := f.Open(context.Background(), format)
+		if err != nil {
+			t.Fatalf("open %s: %v", format, err)
+		}
+		block, err := pcm.NewBlock(format, 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Write(context.Background(), block); err != nil {
+			t.Fatalf("write %s: %v", format, err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if buf.Len() != 16*2*2+16*2*2 { // 16 frames x 2 ch x 2 bytes, twice
+		t.Fatalf("bytes = %d", buf.Len())
+	}
+}
+
+// TestFactoryRejectsMismatch confirms the pinned Factory still refuses a
+// format other than the one it was configured with.
+func TestFactoryRejectsMismatch(t *testing.T) {
+	var buf bytes.Buffer
+	f := Factory(&buf, pcm.Format{Rate: 44100, Channels: 2, Format: pcm.S16LE})
+	if _, err := f.Open(context.Background(), pcm.Format{Rate: 48000, Channels: 2, Format: pcm.S16LE}); err == nil {
+		t.Fatal("expected mismatch error")
+	}
+}

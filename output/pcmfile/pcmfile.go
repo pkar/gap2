@@ -93,17 +93,26 @@ func (s *Sink) Close() error {
 // Factory returns a pcm.Factory that opens Sinks writing format-encoded PCM
 // to w.
 func Factory(w io.Writer, format pcm.Format) pcm.Factory {
-	return factory{w: w, format: format}
+	return factory{w: w, format: format, pinned: true}
+}
+
+// Capture returns a pcm.Factory that writes raw PCM for whatever format the
+// stream negotiates. Unlike Factory, which pins one format, Capture adopts the
+// announced format so a standalone receiver can record streams at any rate or
+// channel count. The writer is shared across opens; callers own its lifetime.
+func Capture(w io.Writer) pcm.Factory {
+	return factory{w: w}
 }
 
 type factory struct {
 	w      io.Writer
 	format pcm.Format
+	pinned bool
 }
 
 func (f factory) Open(_ context.Context, format pcm.Format) (pcm.Sink, error) {
-	if format != f.format {
+	if f.pinned && format != f.format {
 		return nil, errors.New("pcmfile: factory format mismatch")
 	}
-	return New(f.w, f.format)
+	return New(f.w, format)
 }

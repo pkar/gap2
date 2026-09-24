@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -15,6 +16,8 @@ import (
 	"syscall"
 
 	airplay2 "github.com/pkar/gap2"
+	"github.com/pkar/gap2/output/pcmfile"
+	"github.com/pkar/gap2/pcm"
 )
 
 // version is the build version. It is a var so release builds can override it
@@ -30,6 +33,12 @@ func (s *stringSlice) Set(v string) error {
 	*s = append(*s, v)
 	return nil
 }
+
+// nonClosingWriter hides the io.Closer method so a pcmfile sink cannot close a
+// writer whose lifetime the process owns (for example the -output file).
+type nonClosingWriter struct{ w io.Writer }
+
+func (n nonClosingWriter) Write(p []byte) (int, error) { return n.w.Write(p) }
 
 func main() {
 	if len(os.Args) < 2 {
@@ -63,6 +72,8 @@ func run(args []string) {
 	listen := fs.String("listen", ":7000", "control TCP listen address")
 	pin := fs.String("pin", "3939", "numeric pairing setup code")
 	pairings := fs.String("pairings", "", "JSON file for persistent pairings (empty = in-memory)")
+	output := fs.String("output", "", "write decoded PCM to this file (\"-\" for stdout)")
+	debug := fs.Bool("debug", false, "enable debug logging")
 	var ifaces stringSlice
 	fs.Var(&ifaces, "interface", "network interface (repeatable)")
 	fs.Usage = func() {
@@ -71,12 +82,37 @@ func run(args []string) {
 	}
 	_ = fs.Parse(args)
 
+	var out pcm.Factory
+	if *output != "" {
+		var w io.Writer
+		var f *os.File
+		if *output == "-" {
+			w = os.Stdout
+		} else {
+			var err error
+			f, err = os.Create(*output)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "airplay2-receiver: output: %v\n", err)
+				os.Exit(1)
+			}
+			defer f.Close()
+			w = f
+		}
+		// Hide the Closer so the pcmfile sink cannot close the shared output
+		// file between streams; the process owns the file's lifetime.
+		out = pcmfile.Capture(nonClosingWriter{w})
+	}
+
 	cfg := airplay2.Config{
 		Name:         *name,
 		ListenAddr:   *listen,
 		Interfaces:   ifaces,
 		PIN:          *pin,
 		PairingsPath: *pairings,
+		Output:       out,
+	}
+	if *debug {
+		cfg.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 
 	r, err := airplay2.New(cfg)
