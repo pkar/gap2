@@ -66,8 +66,8 @@ func decodeBinary(data []byte, limits Limits) (*Value, error) {
 		return nil, ErrMalformed
 	}
 
-	tableEnd := offsetTable + numObjects*uint64(offsetIntSize)
-	if tableEnd > uint64(len(data)-32) {
+	objectEnd := uint64(len(data) - 32)
+	if offsetTable > objectEnd || numObjects > (objectEnd-offsetTable)/uint64(offsetIntSize) {
 		return nil, ErrMalformed
 	}
 

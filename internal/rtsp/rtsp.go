@@ -170,9 +170,9 @@ func (r *Reader) Read() (*Message, error) {
 	}
 	msg.Headers = headers
 
-	n := msg.ContentLength()
-	if n < 0 {
-		return nil, fmt.Errorf("rtsp: negative content length %d", n)
+	n, err := readContentLength(headers)
+	if err != nil {
+		return nil, err
 	}
 	if n > r.limits.MaxBodyBytes {
 		return nil, ErrBodyTooLarge
@@ -185,6 +185,21 @@ func (r *Reader) Read() (*Message, error) {
 		msg.Body = body
 	}
 	return msg, nil
+}
+
+func readContentLength(headers map[string][]string) (int64, error) {
+	values := headers["content-length"]
+	if len(values) == 0 {
+		return 0, nil
+	}
+	if len(values) != 1 {
+		return 0, fmt.Errorf("rtsp: duplicate Content-Length")
+	}
+	n, err := strconv.ParseInt(values[0], 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("rtsp: invalid Content-Length %q", values[0])
+	}
+	return n, nil
 }
 
 func (r *Reader) readLine() ([]byte, error) {

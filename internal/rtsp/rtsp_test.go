@@ -80,6 +80,20 @@ func TestBodyTooLarge(t *testing.T) {
 	}
 }
 
+func TestInvalidContentLength(t *testing.T) {
+	for _, header := range []string{
+		"Content-Length: nonsense\r\n",
+		"Content-Length: -1\r\n",
+		"Content-Length: 18446744073709551616\r\n",
+		"Content-Length: 1\r\nContent-Length: 2\r\n",
+	} {
+		r := NewReader(strings.NewReader("POST /x RTSP/1.0\r\n"+header+"\r\n"), DefaultLimits())
+		if _, err := r.Read(); err == nil {
+			t.Fatalf("accepted %q", header)
+		}
+	}
+}
+
 func TestTruncated(t *testing.T) {
 	r := NewReader(strings.NewReader("POST /x RTSP/1.0\r\nContent-Length: 10\r\n\r\nshort"), DefaultLimits())
 	if _, err := r.Read(); err == nil {

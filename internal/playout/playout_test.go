@@ -272,6 +272,17 @@ func TestPushBackpressure(t *testing.T) {
 	}
 }
 
+func TestPushRejectsBlockLargerThanBuffer(t *testing.T) {
+	p, err := New(&recordingSink{}, testFormat, Config{Target: 20 * time.Millisecond, Max: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	if err := p.Push(context.Background(), block(4411)); !errors.Is(err, ErrBlockTooLarge) {
+		t.Fatalf("push = %v, want ErrBlockTooLarge", err)
+	}
+}
+
 func TestSinkErrorPropagates(t *testing.T) {
 	sink := &recordingSink{writeErr: errors.New("sink boom")}
 	clock := &fakeClock{now: time.Unix(1000, 0)}

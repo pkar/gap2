@@ -2,6 +2,7 @@ package plist
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"testing"
 	"time"
@@ -170,6 +171,17 @@ func TestByteLimit(t *testing.T) {
 func TestMalformedBinary(t *testing.T) {
 	if _, err := Decode([]byte{0x00, 0x01}, DefaultLimits()); err == nil {
 		t.Fatal("expected error for short input")
+	}
+}
+
+func TestBinaryOffsetTableOverflow(t *testing.T) {
+	encoded, err := Encode(String("ok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.BigEndian.PutUint64(encoded[len(encoded)-8:], ^uint64(0))
+	if _, err := Decode(encoded, DefaultLimits()); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("err = %v, want ErrMalformed", err)
 	}
 }
 

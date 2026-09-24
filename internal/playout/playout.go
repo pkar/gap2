@@ -23,6 +23,7 @@ var (
 	ErrClosed         = errors.New("playout: player closed")
 	ErrFormatMismatch = errors.New("playout: block format does not match player")
 	ErrInvalidConfig  = errors.New("playout: invalid config")
+	ErrBlockTooLarge  = errors.New("playout: block exceeds maximum buffer")
 )
 
 // State is the coarse playback state exposed for status reporting.
@@ -155,7 +156,9 @@ func (p *Player) Push(ctx context.Context, block pcm.Block) error {
 	if frames == 0 {
 		return nil
 	}
-	data := append([]byte(nil), block.Data...)
+	if frames > p.maxFrames {
+		return ErrBlockTooLarge
+	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -201,7 +204,7 @@ func (p *Player) Push(ctx context.Context, block pcm.Block) error {
 		return ErrClosed
 	}
 
-	p.blocks = append(p.blocks, data)
+	p.blocks = append(p.blocks, append([]byte(nil), block.Data...))
 	p.queuedFrames += frames
 	p.cond.Broadcast()
 	return nil
@@ -244,6 +247,7 @@ func (p *Player) Advance(now time.Time) error {
 			p.cond.Broadcast()
 			return err
 		}
+		p.blocks[0] = nil
 		p.blocks = p.blocks[1:]
 		p.nextFrame += frames
 		p.cond.Broadcast()
@@ -280,7 +284,7 @@ func (p *Player) Flush(ctx context.Context) error {
 	if p.closed {
 		return ErrClosed
 	}
-	p.blocks = p.blocks[:0]
+	p.blocks = nil
 	p.queuedFrames = 0
 	p.nextFrame = 0
 	p.started = false

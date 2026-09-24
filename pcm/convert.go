@@ -108,6 +108,19 @@ func (c *Converter) Write(ctx context.Context, b Block) error {
 func mix(b Block, channels int) []float64 {
 	out := make([]float64, b.Frames()*channels)
 	n := b.Format.Channels
+	var mapping [8]int
+	if channels > 2 && n > 1 && n != channels {
+		sources := speakerPositions(n)
+		for dst, d := range speakerPositions(channels) {
+			mapping[dst] = -1
+			for src, s := range sources {
+				if d == s {
+					mapping[dst] = src
+					break
+				}
+			}
+		}
+	}
 	for i := 0; i < b.Frames(); i++ {
 		var v [8]float64
 		for j := 0; j < n; j++ {
@@ -164,32 +177,31 @@ func mix(b Block, channels int) []float64 {
 			out[i*channels+1] = v[0]
 		} else {
 			// Map named positions when layouts gain or lose an LFE slot.
-			names := func(count int) []int {
-				switch count {
-				case 2:
-					return []int{0, 1}
-				case 3:
-					return []int{0, 1, 2}
-				case 4:
-					return []int{0, 1, 2, 8}
-				case 5:
-					return []int{0, 1, 2, 4, 5}
-				case 7:
-					return []int{0, 1, 2, 3, 4, 5, 8}
-				default:
-					return []int{0, 1, 2, 3, 4, 5, 6, 7}[:count]
-				}
-			}
-			for dst, d := range names(channels) {
-				for src, s := range names(n) {
-					if d == s {
-						out[i*channels+dst] = v[src]
-					}
+			for dst := 0; dst < channels; dst++ {
+				if src := mapping[dst]; src >= 0 {
+					out[i*channels+dst] = v[src]
 				}
 			}
 		}
 	}
 	return out
+}
+
+func speakerPositions(count int) []int {
+	switch count {
+	case 2:
+		return []int{0, 1}
+	case 3:
+		return []int{0, 1, 2}
+	case 4:
+		return []int{0, 1, 2, 8}
+	case 5:
+		return []int{0, 1, 2, 4, 5}
+	case 7:
+		return []int{0, 1, 2, 3, 4, 5, 8}
+	default:
+		return []int{0, 1, 2, 3, 4, 5, 6, 7}[:count]
+	}
 }
 
 func (c *Converter) emit(ctx context.Context, tail bool) error {
