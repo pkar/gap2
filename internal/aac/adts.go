@@ -1,7 +1,8 @@
-// Package aac provides bounded parsing and framing for ADTS-wrapped AAC
-// audio. It intentionally stops at the container boundary: decoding the
-// AAC-LC bitstream itself is handled by a codec behind the Decoder interface
-// in a later package.
+// Package aac provides bounded parsing and framing for ADTS-wrapped AAC audio,
+// plus a full AAC-LC spectral decoder: it parses the AudioSpecificConfig, and
+// decodes the Huffman-coded spectral coefficients, the inverse quantization,
+// and the inverse modified discrete cosine transform (IMDCT) filter bank into
+// interleaved PCM.
 package aac
 
 import (
