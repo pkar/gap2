@@ -1,11 +1,16 @@
 // Command embed demonstrates importing the airplay2 package into a host
-// application. Construction and Status are side-effect-free; actual receiver
-// operation is not implemented yet.
+// application: construct a receiver, run it until interrupted, and print the
+// final state on shutdown. Decoded PCM is written to stdout as raw interleaved
+// samples so it can be captured with a redirect; status messages go to stderr
+// so the two streams stay separate.
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	airplay2 "github.com/pkar/gap2"
 	"github.com/pkar/gap2/output/pcmfile"
@@ -27,6 +32,13 @@ func main() {
 	}
 	defer r.Close()
 
-	fmt.Printf("receiver state: %s\n", r.Status().State)
-	fmt.Println("embed: construction and Status are side-effect-free; Run is not implemented yet")
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Fprintf(os.Stderr, "embed: receiver listening on %s (state %s)\n", cfg.ListenAddr, r.Status().State)
+	if err := r.Run(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "embed: run: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "embed: stopped (state %s)\n", r.Status().State)
 }
