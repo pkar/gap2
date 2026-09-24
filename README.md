@@ -59,6 +59,24 @@ examples/embed/         minimal embedding example
 
 The module path is `github.com/pkar/gap2`.
 
+## Install a release
+
+Download and inspect the installer, then run it:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/pkar/gap2/main/install.sh
+sh install.sh
+```
+
+The script installs the newest published release, including prereleases, to
+`~/.local/bin`. It verifies Linux amd64/arm64 and macOS arm64 binaries against
+the release's SHA-256 checksums. Other Linux/macOS targets build the same tag
+from source using Go 1.24 or newer. Set `GAP2_VERSION` to pin a release tag or
+`GAP2_INSTALL_DIR` to change the installation directory. Checksums detect
+corruption; they are not independent signatures. See [releases](https://github.com/pkar/gap2/releases).
+The installer places the command only; configure audio output and any service
+separately as described below.
+
 ## Build and test
 
 ```sh
