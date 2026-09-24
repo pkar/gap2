@@ -3,6 +3,7 @@ package airplay2
 import (
 	"bufio"
 	"bytes"
+	"log/slog"
 	"testing"
 
 	"github.com/pkar/gap2/internal/plist"
@@ -83,7 +84,7 @@ func TestSendUpdateInfoNilInfo(t *testing.T) {
 }
 
 // TestDecodeEventCommand checks that a command body is decoded to its "type"
-// and "value" nodes.
+// string and the full command dict.
 func TestDecodeEventCommand(t *testing.T) {
 	body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
 		"type":  plist.String("setRate"),
@@ -92,35 +93,39 @@ func TestDecodeEventCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	typ, val, err := decodeEventCommand(body)
+	typ, cmd, err := decodeEventCommand(body)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if typ != "setRate" {
 		t.Fatalf("type = %q, want setRate", typ)
 	}
-	if val == nil || val.Kind != plist.KindReal || val.Real != 1.0 {
-		t.Fatalf("value = %+v, want real 1.0", val)
+	if cmd == nil || cmd.Kind != plist.KindDict {
+		t.Fatalf("command = %+v, want dict", cmd)
+	}
+	if v, ok := cmd.Dict["value"]; !ok || v.Kind != plist.KindReal || v.Real != 1.0 {
+		t.Fatalf("value = %+v, want real 1.0", cmd.Dict["value"])
 	}
 }
 
-// TestDecodeEventCommandNoValue covers a command body without a "value" key.
-func TestDecodeEventCommandNoValue(t *testing.T) {
+// TestDecodeEventCommandNoPayload covers a command body without any payload
+// key beyond "type".
+func TestDecodeEventCommandNoPayload(t *testing.T) {
 	body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
 		"type": plist.String("ping"),
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	typ, val, err := decodeEventCommand(body)
+	typ, cmd, err := decodeEventCommand(body)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if typ != "ping" {
 		t.Fatalf("type = %q, want ping", typ)
 	}
-	if val != nil {
-		t.Fatalf("value = %+v, want nil", val)
+	if cmd == nil || cmd.Kind != plist.KindDict {
+		t.Fatalf("command = %+v, want dict", cmd)
 	}
 }
 
@@ -142,5 +147,103 @@ func TestDecodeEventCommandErrors(t *testing.T) {
 	}
 	if _, _, err := decodeEventCommand(body); err == nil {
 		t.Fatal("expected error for missing type")
+	}
+}
+
+// playbackStateCommand encodes an updateMRPlaybackState command body with the
+// given mrPlaybackState value.
+func playbackStateCommand(state int64) []byte {
+	body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
+		"type": plist.String(commandUpdateMRPlaybackState),
+		"params": plist.Dict(map[string]*plist.Value{
+			"mrPlaybackState": plist.Int(state),
+		}),
+	}))
+	if err != nil {
+		panic(err)
+	}
+	return body
+}
+
+// TestMrPlaybackState extracts the mrPlaybackState field across valid and
+// invalid shapes.
+func TestMrPlaybackState(t *testing.T) {
+	for _, tc := range []struct {
+		state int64
+		want  playbackState
+	}{
+		{1, playbackPlaying},
+		{2, playbackPaused},
+		{3, playbackStopped},
+		{4, playbackInterrupted},
+		{0, playbackUnknown},
+	} {
+		_, cmd, err := decodeEventCommand(playbackStateCommand(tc.state))
+		if err != nil {
+			t.Fatalf("decode state %d: %v", tc.state, err)
+		}
+		got, ok := mrPlaybackState(cmd)
+		if !ok || got != tc.want {
+			t.Fatalf("mrPlaybackState(%d) = (%v, %v), want (%v, true)", tc.state, got, ok, tc.want)
+		}
+	}
+
+	// Missing params.
+	_, cmd, _ := decodeEventCommand(playbackStateCommand(1))
+	delete(cmd.Dict, "params")
+	if _, ok := mrPlaybackState(cmd); ok {
+		t.Fatal("mrPlaybackState ok without params")
+	}
+
+	// Non-integer state.
+	_, cmd, _ = decodeEventCommand(playbackStateCommand(1))
+	cmd.Dict["params"].Dict["mrPlaybackState"] = *plist.String("playing")
+	if _, ok := mrPlaybackState(cmd); ok {
+		t.Fatal("mrPlaybackState ok with string state")
+	}
+}
+
+// TestHandleEventCommandPlaybackState verifies that an updateMRPlaybackState
+// command updates the handler's reported playback state.
+func TestHandleEventCommandPlaybackState(t *testing.T) {
+	h := &mediaHandler{log: slog.Default()}
+	_, cmd, err := decodeEventCommand(playbackStateCommand(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.handleEventCommand(commandUpdateMRPlaybackState, cmd)
+	if got := h.PlaybackState(); got != playbackPaused {
+		t.Fatalf("PlaybackState = %v, want paused", got)
+	}
+}
+
+// TestNowPlayingInfo checks the "title - artist (album)" summary.
+func TestNowPlayingInfo(t *testing.T) {
+	body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
+		"type": plist.String(commandUpdateMRNowPlayingInfo),
+		"params": plist.Dict(map[string]*plist.Value{
+			"params": plist.Dict(map[string]*plist.Value{
+				"kMRMediaRemoteNowPlayingInfoTitle":  plist.String("Song"),
+				"kMRMediaRemoteNowPlayingInfoArtist": plist.String("Artist"),
+				"kMRMediaRemoteNowPlayingInfoAlbum":  plist.String("Album"),
+			}),
+		}),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cmd, err := decodeEventCommand(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nowPlayingInfo(cmd); got != "Song - Artist (Album)" {
+		t.Fatalf("nowPlayingInfo = %q, want %q", got, "Song - Artist (Album)")
+	}
+}
+
+// TestPlaybackStateString covers the String method.
+func TestPlaybackStateString(t *testing.T) {
+	if playbackPlaying.String() != "playing" || playbackUnknown.String() != "unknown" {
+		t.Fatalf("unexpected String values: %q %q", playbackPlaying.String(), playbackUnknown.String())
 	}
 }

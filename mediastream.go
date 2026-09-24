@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync/atomic"
 
 	"github.com/pkar/gap2/internal/media"
 	"github.com/pkar/gap2/internal/playout"
@@ -48,6 +49,12 @@ type mediaHandler struct {
 	// open for the life of the session so the advertised ports remain valid.
 	eventLn     net.Listener
 	controlConn net.PacketConn
+
+	// playback is the sender-reported playback state carried by
+	// updateMRPlaybackState commands over the event channel. It is written
+	// from the event-channel goroutine and read via PlaybackState, so it uses
+	// an atomic.
+	playback atomic.Uint32
 }
 
 func newMediaHandler(cfg Config, log *slog.Logger, clock *ptp.Clock) *mediaHandler {

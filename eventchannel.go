@@ -54,12 +54,53 @@ func (h *mediaHandler) sendUpdateInfo(w io.Writer) error {
 	return writeEventCommand(w, body)
 }
 
-// readEventCommands reads and logs the remote-control commands the sender posts
-// over the event channel (for example setRate, setVolume, updateAudioFormat,
-// and updateProgress). Commands are framed as "POST /command RTSP/1.0"
-// requests with binary-plist bodies. Each body is decoded to its "type" for
-// observability; acting on the commands (rate/volume plumbing) is a future
-// extension.
+// Event-channel command types the sender posts to the receiver. These are
+// one-way notifications (no response is expected), carrying metadata and
+// playback state from the source device.
+const (
+	commandUpdateMRNowPlayingInfo    = "updateMRNowPlayingInfo"
+	commandUpdateMRSupportedCommands = "updateMRSupportedCommands"
+	commandUpdateMRPlaybackState     = "updateMRPlaybackState"
+)
+
+// playbackState is the sender-reported play/pause state carried by
+// updateMRPlaybackState commands, matching MediaRemote's MRPlaybackState
+// values.
+type playbackState uint32
+
+const (
+	playbackUnknown     playbackState = 0
+	playbackPlaying     playbackState = 1
+	playbackPaused      playbackState = 2
+	playbackStopped     playbackState = 3
+	playbackInterrupted playbackState = 4
+)
+
+// String returns a human-readable name for the playback state.
+func (s playbackState) String() string {
+	switch s {
+	case playbackPlaying:
+		return "playing"
+	case playbackPaused:
+		return "paused"
+	case playbackStopped:
+		return "stopped"
+	case playbackInterrupted:
+		return "interrupted"
+	default:
+		return "unknown"
+	}
+}
+
+// PlaybackState returns the most recently reported playback state.
+func (h *mediaHandler) PlaybackState() playbackState {
+	return playbackState(h.playback.Load())
+}
+
+// readEventCommands reads the remote-control notifications the sender posts
+// over the event channel (updateMRNowPlayingInfo, updateMRSupportedCommands
+// and updateMRPlaybackState) and dispatches each decoded command. These are
+// one-way notifications: the sender expects no response.
 func (h *mediaHandler) readEventCommands(ec *hap.Conn) {
 	br := bufio.NewReader(ec)
 	for {
@@ -70,24 +111,41 @@ func (h *mediaHandler) readEventCommands(ec *hap.Conn) {
 			}
 			return
 		}
-		h.logEventCommand(req.body)
+		typ, cmd, err := decodeEventCommand(req.body)
+		if err != nil {
+			h.log.Debug("event command decode failed", "err", err, "bytes", len(req.body))
+			continue
+		}
+		h.handleEventCommand(typ, cmd)
 	}
 }
 
-// logEventCommand decodes an event-channel command body and logs its type. It
-// is the observation point where setRate/setVolume handling will attach.
-func (h *mediaHandler) logEventCommand(body []byte) {
-	typ, _, err := decodeEventCommand(body)
-	if err != nil {
-		h.log.Debug("event command decode failed", "err", err, "bytes", len(body))
-		return
+// handleEventCommand dispatches a decoded event-channel command. The sender's
+// commands are notifications: updateMRPlaybackState updates the playback
+// state, while the now-playing-info and supported-commands updates are logged
+// for observability. No response is written back.
+func (h *mediaHandler) handleEventCommand(typ string, cmd *plist.Value) {
+	switch typ {
+	case commandUpdateMRPlaybackState:
+		if st, ok := mrPlaybackState(cmd); ok {
+			h.playback.Store(uint32(st))
+			h.log.Debug("event playback state", "state", st.String())
+			return
+		}
+	case commandUpdateMRNowPlayingInfo:
+		if info := nowPlayingInfo(cmd); info != "" {
+			h.log.Debug("event now playing", "info", info)
+			return
+		}
+	case commandUpdateMRSupportedCommands:
+		// Informational; nothing actionable for a receive-only device.
+	default:
 	}
 	h.log.Debug("event command", "type", typ)
 }
 
 // decodeEventCommand decodes one event-channel command body, a binary plist
-// dict, and returns its "type" string and the type-specific "value" node (nil
-// when absent).
+// dict, and returns its "type" string together with the full command dict.
 func decodeEventCommand(body []byte) (string, *plist.Value, error) {
 	v, err := plist.Decode(body, plist.DefaultLimits())
 	if err != nil {
@@ -100,11 +158,85 @@ func decodeEventCommand(body []byte) (string, *plist.Value, error) {
 	if !ok || typ.Kind != plist.KindString {
 		return "", nil, fmt.Errorf("airplay2: event command missing type")
 	}
-	var val *plist.Value
-	if vv, ok := v.Dict["value"]; ok {
-		val = &vv
+	return typ.String, v, nil
+}
+
+// mrPlaybackState extracts the mrPlaybackState field of an
+// updateMRPlaybackState command (command.params.mrPlaybackState).
+func mrPlaybackState(cmd *plist.Value) (playbackState, bool) {
+	params, ok := dictField(cmd, "params")
+	if !ok {
+		return 0, false
 	}
-	return typ.String, val, nil
+	st, ok := params.Dict["mrPlaybackState"]
+	if !ok || st.Kind != plist.KindInt {
+		return 0, false
+	}
+	return playbackState(st.Int), true
+}
+
+// nowPlayingInfo extracts a concise "title - artist (album)" description of
+// the track from an updateMRNowPlayingInfo command, or "" when no recognised
+// field is present. The now-playing dictionary nests under
+// command.params.params and uses MediaRemote keys.
+func nowPlayingInfo(cmd *plist.Value) string {
+	params, ok := dictField(cmd, "params")
+	if !ok {
+		return ""
+	}
+	npi, ok := dictField(params, "params")
+	if !ok {
+		return ""
+	}
+	title := stringField(npi, "kMRMediaRemoteNowPlayingInfoTitle")
+	artist := stringField(npi, "kMRMediaRemoteNowPlayingInfoArtist")
+	album := stringField(npi, "kMRMediaRemoteNowPlayingInfoAlbum")
+	if title == "" && artist == "" && album == "" {
+		return ""
+	}
+	var b strings.Builder
+	if title != "" {
+		b.WriteString(title)
+	}
+	if artist != "" {
+		if b.Len() > 0 {
+			b.WriteString(" - ")
+		}
+		b.WriteString(artist)
+	}
+	if album != "" {
+		if b.Len() > 0 {
+			b.WriteString(" (")
+			b.WriteString(album)
+			b.WriteByte(')')
+		}
+	}
+	return b.String()
+}
+
+// dictField returns the dict-valued field key of a dict node, or ok=false when
+// cmd is not a dict or the field is absent or not a dict.
+func dictField(cmd *plist.Value, key string) (*plist.Value, bool) {
+	if cmd == nil || cmd.Kind != plist.KindDict {
+		return nil, false
+	}
+	v, ok := cmd.Dict[key]
+	if !ok || v.Kind != plist.KindDict {
+		return nil, false
+	}
+	return &v, true
+}
+
+// stringField returns the string-valued field key of a dict node, or "".
+func stringField(dict *plist.Value, key string) string {
+	if dict == nil || dict.Kind != plist.KindDict {
+		return ""
+	}
+	v, ok := dict.Dict[key]
+	if !ok || v.Kind != plist.KindString {
+		return ""
+	}
+	return v.String
 }
 
 // readEventRequest parses one event-channel command request using the same
