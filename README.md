@@ -57,8 +57,7 @@ cmd/airplay2-receiver/  standalone command
 examples/embed/         minimal embedding example
 ```
 
-The module path is `github.com/pkar/gap2`; it is a placeholder and can be
-changed with a single `go.mod` edit plus import-path rewrites.
+The module path is `github.com/pkar/gap2`.
 
 ## Build and test
 
