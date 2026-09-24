@@ -55,6 +55,11 @@ type mediaHandler struct {
 	// from the event-channel goroutine and read via PlaybackState, so it uses
 	// an atomic.
 	playback atomic.Uint32
+
+	// nowPlaying is the most recent now-playing snapshot reported over the
+	// event channel. The pointed-to value is immutable after storage, so it
+	// can be shared with readers via NowPlaying without a lock.
+	nowPlaying atomic.Pointer[NowPlaying]
 }
 
 func newMediaHandler(cfg Config, log *slog.Logger, clock *ptp.Clock) *mediaHandler {

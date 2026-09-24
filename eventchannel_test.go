@@ -217,15 +217,21 @@ func TestHandleEventCommandPlaybackState(t *testing.T) {
 	}
 }
 
-// TestNowPlayingInfo checks the "title - artist (album)" summary.
-func TestNowPlayingInfo(t *testing.T) {
+// TestParseNowPlaying checks the full now-playing extraction including
+// duration, playback rate, and track number.
+func TestParseNowPlaying(t *testing.T) {
 	body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
 		"type": plist.String(commandUpdateMRNowPlayingInfo),
 		"params": plist.Dict(map[string]*plist.Value{
 			"params": plist.Dict(map[string]*plist.Value{
-				"kMRMediaRemoteNowPlayingInfoTitle":  plist.String("Song"),
-				"kMRMediaRemoteNowPlayingInfoArtist": plist.String("Artist"),
-				"kMRMediaRemoteNowPlayingInfoAlbum":  plist.String("Album"),
+				"kMRMediaRemoteNowPlayingInfoTitle":            plist.String("Song"),
+				"kMRMediaRemoteNowPlayingInfoArtist":           plist.String("Artist"),
+				"kMRMediaRemoteNowPlayingInfoAlbum":            plist.String("Album"),
+				"kMRMediaRemoteNowPlayingInfoGenre":            plist.String("Rock"),
+				"kMRMediaRemoteNowPlayingInfoDuration":         plist.Real(180.5),
+				"kMRMediaRemoteNowPlayingInfoPlaybackRate":     plist.Real(1.0),
+				"kMRMediaRemoteNowPlayingInfoTrackNumber":      plist.Int(3),
+				"kMRMediaRemoteNowPlayingInfoUniqueIdentifier": plist.String("track-1"),
 			}),
 		}),
 	}))
@@ -236,8 +242,67 @@ func TestNowPlayingInfo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := nowPlayingInfo(cmd); got != "Song - Artist (Album)" {
-		t.Fatalf("nowPlayingInfo = %q, want %q", got, "Song - Artist (Album)")
+	np, ok := parseNowPlaying(cmd)
+	if !ok {
+		t.Fatal("parseNowPlaying ok = false")
+	}
+	if np.Title != "Song" || np.Artist != "Artist" || np.Album != "Album" {
+		t.Fatalf("unexpected identity fields: %+v", np)
+	}
+	if np.Genre != "Rock" || np.UniqueID != "track-1" {
+		t.Fatalf("unexpected genre/id: %+v", np)
+	}
+	if np.Duration != 180.5 || np.PlaybackRate != 1.0 || np.TrackNumber != 3 {
+		t.Fatalf("unexpected numeric fields: %+v", np)
+	}
+	if got := np.Summary(); got != "Song - Artist (Album)" {
+		t.Fatalf("Summary = %q", got)
+	}
+}
+
+// TestParseNowPlayingEmpty verifies ok=false when no identifying field is
+// present.
+func TestParseNowPlayingEmpty(t *testing.T) {
+	body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
+		"type": plist.String(commandUpdateMRNowPlayingInfo),
+		"params": plist.Dict(map[string]*plist.Value{
+			"params": plist.Dict(map[string]*plist.Value{
+				"kMRMediaRemoteNowPlayingInfoPlaybackRate": plist.Real(1.0),
+			}),
+		}),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cmd, _ := decodeEventCommand(body)
+	if _, ok := parseNowPlaying(cmd); ok {
+		t.Fatal("parseNowPlaying ok = true for playback-rate-only body")
+	}
+}
+
+// TestHandleEventCommandNowPlaying verifies that an updateMRNowPlayingInfo
+// command updates the handler's now-playing snapshot.
+func TestHandleEventCommandNowPlaying(t *testing.T) {
+	h := &mediaHandler{log: slog.Default()}
+	body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
+		"type": plist.String(commandUpdateMRNowPlayingInfo),
+		"params": plist.Dict(map[string]*plist.Value{
+			"params": plist.Dict(map[string]*plist.Value{
+				"kMRMediaRemoteNowPlayingInfoTitle":  plist.String("Song"),
+				"kMRMediaRemoteNowPlayingInfoArtist": plist.String("Artist"),
+			}),
+		}),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cmd, err := decodeEventCommand(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.handleEventCommand(commandUpdateMRNowPlayingInfo, cmd)
+	if got := h.NowPlaying(); got == nil || got.Title != "Song" || got.Artist != "Artist" {
+		t.Fatalf("NowPlaying = %+v", got)
 	}
 }
 

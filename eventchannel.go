@@ -122,8 +122,9 @@ func (h *mediaHandler) readEventCommands(ec *hap.Conn) {
 
 // handleEventCommand dispatches a decoded event-channel command. The sender's
 // commands are notifications: updateMRPlaybackState updates the playback
-// state, while the now-playing-info and supported-commands updates are logged
-// for observability. No response is written back.
+// state, updateMRNowPlayingInfo replaces the now-playing snapshot, and
+// supported-commands updates are recognised but not actionable. No response is
+// written back.
 func (h *mediaHandler) handleEventCommand(typ string, cmd *plist.Value) {
 	switch typ {
 	case commandUpdateMRPlaybackState:
@@ -133,8 +134,9 @@ func (h *mediaHandler) handleEventCommand(typ string, cmd *plist.Value) {
 			return
 		}
 	case commandUpdateMRNowPlayingInfo:
-		if info := nowPlayingInfo(cmd); info != "" {
-			h.log.Debug("event now playing", "info", info)
+		if np, ok := parseNowPlaying(cmd); ok {
+			h.nowPlaying.Store(np)
+			h.log.Debug("event now playing", "info", np.Summary())
 			return
 		}
 	case commandUpdateMRSupportedCommands:
@@ -175,43 +177,77 @@ func mrPlaybackState(cmd *plist.Value) (playbackState, bool) {
 	return playbackState(st.Int), true
 }
 
-// nowPlayingInfo extracts a concise "title - artist (album)" description of
-// the track from an updateMRNowPlayingInfo command, or "" when no recognised
-// field is present. The now-playing dictionary nests under
-// command.params.params and uses MediaRemote keys.
-func nowPlayingInfo(cmd *plist.Value) string {
-	params, ok := dictField(cmd, "params")
-	if !ok {
-		return ""
-	}
-	npi, ok := dictField(params, "params")
-	if !ok {
-		return ""
-	}
-	title := stringField(npi, "kMRMediaRemoteNowPlayingInfoTitle")
-	artist := stringField(npi, "kMRMediaRemoteNowPlayingInfoArtist")
-	album := stringField(npi, "kMRMediaRemoteNowPlayingInfoAlbum")
-	if title == "" && artist == "" && album == "" {
-		return ""
-	}
+// NowPlaying is a snapshot of the current track reported by the sender over
+// the event channel. Zero-valued fields are unknown/absent. The snapshot is
+// immutable after it is stored.
+type NowPlaying struct {
+	Title        string
+	Artist       string
+	Album        string
+	Genre        string
+	Composer     string
+	UniqueID     string
+	Duration     float64 // seconds; 0 when unknown
+	PlaybackRate float64
+	TrackNumber  int64
+}
+
+// Summary returns a concise "title - artist (album)" description.
+func (n *NowPlaying) Summary() string {
 	var b strings.Builder
-	if title != "" {
-		b.WriteString(title)
+	if n.Title != "" {
+		b.WriteString(n.Title)
 	}
-	if artist != "" {
+	if n.Artist != "" {
 		if b.Len() > 0 {
 			b.WriteString(" - ")
 		}
-		b.WriteString(artist)
+		b.WriteString(n.Artist)
 	}
-	if album != "" {
+	if n.Album != "" {
 		if b.Len() > 0 {
 			b.WriteString(" (")
-			b.WriteString(album)
+			b.WriteString(n.Album)
 			b.WriteByte(')')
 		}
 	}
 	return b.String()
+}
+
+// NowPlaying returns the most recently reported now-playing snapshot, or nil
+// if none has been received.
+func (h *mediaHandler) NowPlaying() *NowPlaying {
+	return h.nowPlaying.Load()
+}
+
+// parseNowPlaying extracts the now-playing fields of an
+// updateMRNowPlayingInfo command. The now-playing dictionary nests under
+// command.params.params and uses MediaRemote keys. ok is false when no
+// identifying field is present.
+func parseNowPlaying(cmd *plist.Value) (*NowPlaying, bool) {
+	params, ok := dictField(cmd, "params")
+	if !ok {
+		return nil, false
+	}
+	npi, ok := dictField(params, "params")
+	if !ok {
+		return nil, false
+	}
+	np := &NowPlaying{
+		Title:        stringField(npi, "kMRMediaRemoteNowPlayingInfoTitle"),
+		Artist:       stringField(npi, "kMRMediaRemoteNowPlayingInfoArtist"),
+		Album:        stringField(npi, "kMRMediaRemoteNowPlayingInfoAlbum"),
+		Genre:        stringField(npi, "kMRMediaRemoteNowPlayingInfoGenre"),
+		Composer:     stringField(npi, "kMRMediaRemoteNowPlayingInfoComposer"),
+		UniqueID:     stringField(npi, "kMRMediaRemoteNowPlayingInfoUniqueIdentifier"),
+		Duration:     realField(npi, "kMRMediaRemoteNowPlayingInfoDuration"),
+		PlaybackRate: realField(npi, "kMRMediaRemoteNowPlayingInfoPlaybackRate"),
+		TrackNumber:  intField(npi, "kMRMediaRemoteNowPlayingInfoTrackNumber"),
+	}
+	if np.Title == "" && np.Artist == "" && np.Album == "" && np.UniqueID == "" {
+		return nil, false
+	}
+	return np, true
 }
 
 // dictField returns the dict-valued field key of a dict node, or ok=false when
@@ -237,6 +273,30 @@ func stringField(dict *plist.Value, key string) string {
 		return ""
 	}
 	return v.String
+}
+
+// realField returns the real-valued field key of a dict node, or 0.
+func realField(dict *plist.Value, key string) float64 {
+	if dict == nil || dict.Kind != plist.KindDict {
+		return 0
+	}
+	v, ok := dict.Dict[key]
+	if !ok || v.Kind != plist.KindReal {
+		return 0
+	}
+	return v.Real
+}
+
+// intField returns the integer-valued field key of a dict node, or 0.
+func intField(dict *plist.Value, key string) int64 {
+	if dict == nil || dict.Kind != plist.KindDict {
+		return 0
+	}
+	v, ok := dict.Dict[key]
+	if !ok || v.Kind != plist.KindInt {
+		return 0
+	}
+	return v.Int
 }
 
 // readEventRequest parses one event-channel command request using the same
