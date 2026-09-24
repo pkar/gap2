@@ -190,6 +190,8 @@ type NowPlaying struct {
 	Duration     float64 // seconds; 0 when unknown
 	PlaybackRate float64
 	TrackNumber  int64
+	// Artwork is the cover art image (JPEG/PNG) bytes, or nil when absent.
+	Artwork []byte
 }
 
 // Summary returns a concise "title - artist (album)" description.
@@ -243,6 +245,7 @@ func parseNowPlaying(cmd *plist.Value) (*NowPlaying, bool) {
 		Duration:     realField(npi, "kMRMediaRemoteNowPlayingInfoDuration"),
 		PlaybackRate: realField(npi, "kMRMediaRemoteNowPlayingInfoPlaybackRate"),
 		TrackNumber:  intField(npi, "kMRMediaRemoteNowPlayingInfoTrackNumber"),
+		Artwork:      dataField(npi, "kMRMediaRemoteNowPlayingInfoArtworkData"),
 	}
 	if np.Title == "" && np.Artist == "" && np.Album == "" && np.UniqueID == "" {
 		return nil, false
@@ -297,6 +300,20 @@ func intField(dict *plist.Value, key string) int64 {
 		return 0
 	}
 	return v.Int
+}
+
+// dataField returns the data-valued field key of a dict node as a copy, or
+// nil. The copy detaches the snapshot from the decoded request buffer so the
+// immutable snapshot does not alias transient input.
+func dataField(dict *plist.Value, key string) []byte {
+	if dict == nil || dict.Kind != plist.KindDict {
+		return nil
+	}
+	v, ok := dict.Dict[key]
+	if !ok || v.Kind != plist.KindData {
+		return nil
+	}
+	return append([]byte(nil), v.Data...)
 }
 
 // readEventRequest parses one event-channel command request using the same

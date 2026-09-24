@@ -260,6 +260,40 @@ func TestParseNowPlaying(t *testing.T) {
 	}
 }
 
+// TestParseNowPlayingArtwork verifies cover-art bytes are extracted and copied
+// out of the decoded body.
+func TestParseNowPlayingArtwork(t *testing.T) {
+	art := []byte{0xff, 0xd8, 0xff, 0xd9} // JPEG magic
+	body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
+		"type": plist.String(commandUpdateMRNowPlayingInfo),
+		"params": plist.Dict(map[string]*plist.Value{
+			"params": plist.Dict(map[string]*plist.Value{
+				"kMRMediaRemoteNowPlayingInfoTitle":       plist.String("Song"),
+				"kMRMediaRemoteNowPlayingInfoArtworkData": plist.Data(art),
+			}),
+		}),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cmd, err := decodeEventCommand(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	np, ok := parseNowPlaying(cmd)
+	if !ok {
+		t.Fatal("parseNowPlaying ok = false")
+	}
+	if !bytes.Equal(np.Artwork, art) {
+		t.Fatalf("Artwork = %x, want %x", np.Artwork, art)
+	}
+	// The snapshot must not alias the decoded body's buffer.
+	np.Artwork[0] = 0x00
+	if bytes.Equal(np.Artwork, art) {
+		t.Fatal("Artwork aliases the decoded body")
+	}
+}
+
 // TestParseNowPlayingEmpty verifies ok=false when no identifying field is
 // present.
 func TestParseNowPlayingEmpty(t *testing.T) {
