@@ -1,5 +1,6 @@
 # Build artifacts
 /airplay2-receiver
+/embed
 /bin/
 /dist/
 
