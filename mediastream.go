@@ -133,6 +133,13 @@ func (h *mediaHandler) announce(cs *connState, req *ctlRequest) error {
 	if err != nil {
 		return cs.writeRTSPResponse(cseq, 415, "Unsupported Media Type", nil, nil)
 	}
+	// Validate the codec before opening the sink so an unsupported format (for
+	// example 24-bit or multichannel ALAC) is rejected without opening output.
+	// NewSession re-derives the decoder below; construction is cheap.
+	if _, err := stream.NewDecoder(m); err != nil {
+		h.log.Debug("media codec rejected", "err", err)
+		return cs.writeRTSPResponse(cseq, 415, "Unsupported Media Type", nil, nil)
+	}
 	sink, err := h.cfg.Output.Open(h.ctx, format)
 	if err != nil {
 		h.log.Debug("media sink open failed", "err", err)

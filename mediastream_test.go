@@ -170,6 +170,37 @@ func TestMediaAnnounceNoOutput(t *testing.T) {
 	}
 }
 
+// TestMediaAnnounceRejectsCodec ensures a codec the decoder cannot handle (for
+// example 24-bit ALAC) is rejected with 415 before the output sink is opened.
+func TestMediaAnnounceRejectsCodec(t *testing.T) {
+	factory := &mediaFactory{sink: &mediaRecordingSink{}}
+	s := newTestMediaServer(t, factory)
+
+	buf := &bytes.Buffer{}
+	cs := &connState{log: s.log, w: buf}
+
+	// 24-bit ALAC: the SDP parses and the format derives, but the ALAC decoder
+	// only supports 16-bit, so ANNOUNCE must fail without opening output.
+	body := "v=0\r\n" +
+		"o=iTunes 3413825038 0 IN IP4 192.168.1.2\r\n" +
+		"s=iTunes\r\n" +
+		"c=IN IP4 192.168.1.2\r\n" +
+		"t=0 0\r\n" +
+		"m=audio 0 RTP/AVP 96\r\n" +
+		"a=rtpmap:96 AppleLossless\r\n" +
+		"a=fmtp:96 352 0 24 40 10 14 2 255 0 0 44100\r\n"
+
+	if err := s.handleMedia(cs, mediaRequest("ANNOUNCE", "rtsp://host/1", "1", nil, body)); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); !strings.Contains(got, "RTSP/1.0 415") {
+		t.Fatalf("unsupported-codec response = %q", got)
+	}
+	if factory.sink.format.Rate != 0 {
+		t.Fatalf("sink opened for rejected codec: format = %+v", factory.sink.format)
+	}
+}
+
 // fakeTCPAddr and fakeListener stand in for a bound TCP listener in tests.
 type fakeTCPAddr struct{ port int }
 
