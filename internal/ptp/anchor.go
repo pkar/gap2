@@ -48,3 +48,12 @@ func (a Anchor) FrameAtMaster(masterNs uint64) (uint32, bool) {
 	delta := deltaNs * int64(a.Rate) / 1_000_000_000
 	return a.Frame + uint32(int32(delta)), true
 }
+
+// NetworkTimeNanoseconds converts the networkTimeSecs and networkTimeFrac
+// fields of a SETRATEANCHORI request into a whole-nanosecond grandmaster time.
+// networkTimeFrac is a fixed-point fraction of a second with the binary point
+// after bit 32 (bit 63 is worth half a second); the low 32 bits are discarded
+// before scaling, matching the reference conversion.
+func NetworkTimeNanoseconds(secs, frac uint64) uint64 {
+	return secs*1_000_000_000 + (frac>>32)*1_000_000_000>>32
+}

@@ -32,6 +32,12 @@ type Clock struct {
 	raw int64
 	// samples counts Follow_Up messages since the master was selected.
 	samples uint64
+
+	// anchor maps an RTP timestamp to a grandmaster presentation time, as
+	// announced by the sender's SETRATEANCHORI request. anchorSet reports
+	// whether a usable anchor (positive rate) has been recorded.
+	anchor    Anchor
+	anchorSet bool
 }
 
 // Info is a snapshot of the clock's current state.
@@ -144,4 +150,38 @@ func (c *Clock) LocalTime(masterNs uint64) (uint64, bool) {
 		return 0, false
 	}
 	return uint64(int64(masterNs) - c.offsetNs), true
+}
+
+// SetAnchor records the sender's playback anchor: the RTP frame Frame will be
+// presented at grandmaster time MasterNs, and subsequent frames follow at the
+// sample rate Rate. An anchor with a non-positive rate is ignored.
+func (c *Clock) SetAnchor(a Anchor) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if a.Rate <= 0 {
+		return
+	}
+	c.anchor = a
+	c.anchorSet = true
+}
+
+// Anchor returns the most recent playback anchor and whether one is set.
+func (c *Clock) Anchor() (Anchor, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.anchor, c.anchorSet
+}
+
+// FrameLocalTime returns the local monotonic time, in nanoseconds, at which
+// the RTP frame with timestamp frame should be presented. It combines the
+// playback anchor (RTP timestamp -> grandmaster time) with the offset estimate
+// (grandmaster time -> local time), and returns ok=false when either the
+// anchor or the offset estimate is unavailable.
+func (c *Clock) FrameLocalTime(frame uint32) (uint64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.anchorSet || !c.valid {
+		return 0, false
+	}
+	return c.anchor.LocalTime(frame, c.offsetNs)
 }

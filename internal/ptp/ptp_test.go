@@ -206,3 +206,46 @@ func TestClockAnnounceResetsOffset(t *testing.T) {
 		t.Fatalf("master id = %x, want %x", info.MasterID, gm)
 	}
 }
+
+func TestClockAnchor(t *testing.T) {
+	c := NewClock()
+
+	// No anchor until one is set.
+	if _, ok := c.Anchor(); ok {
+		t.Fatal("anchor available before SetAnchor")
+	}
+	// A zero-rate anchor is rejected.
+	c.SetAnchor(Anchor{Frame: 1, MasterNs: 2, Rate: 0})
+	if _, ok := c.Anchor(); ok {
+		t.Fatal("zero-rate anchor accepted")
+	}
+
+	a := Anchor{Frame: 0, MasterNs: 10_000_000_000, Rate: 44100}
+	c.SetAnchor(a)
+	got, ok := c.Anchor()
+	if !ok || got != a {
+		t.Fatalf("Anchor = %+v, %v; want %+v, true", got, ok, a)
+	}
+
+	// FrameLocalTime needs a valid offset estimate too.
+	if _, ok := c.FrameLocalTime(0); ok {
+		t.Fatal("FrameLocalTime ok before offset estimate")
+	}
+
+	// Establish offset = +500ns via a Follow_Up.
+	c.HandleFollowUp(Message{
+		Header:  Header{MessageType: TypeFollowUp},
+		Precise: Timestamp{Seconds: 10, Nanos: 500},
+	}, 10_000_000_000)
+
+	// The anchor frame plays at master 10s; local = master - offset.
+	lt, ok := c.FrameLocalTime(0)
+	if !ok || lt != 10_000_000_000-500 {
+		t.Fatalf("FrameLocalTime(anchor) = %d, %v; want 9999999500, true", lt, ok)
+	}
+	// One second of frames later (+44100 frames).
+	lt, _ = c.FrameLocalTime(44100)
+	if lt != 11_000_000_000-500 {
+		t.Fatalf("FrameLocalTime(+1s) = %d, want 10999999500", lt)
+	}
+}

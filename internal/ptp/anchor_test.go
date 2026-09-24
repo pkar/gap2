@@ -68,3 +68,26 @@ func TestAnchorInvalidRate(t *testing.T) {
 		t.Fatal("FrameAtMaster ok with zero rate")
 	}
 }
+
+func TestNetworkTimeNanoseconds(t *testing.T) {
+	cases := []struct {
+		secs, frac uint64
+		want       uint64
+	}{
+		{0, 0, 0},
+		{1, 0, 1_000_000_000},
+		// frac bit 63 set = 1/2 second.
+		{0, 1 << 63, 500_000_000},
+		// frac bit 32 set = 1/2^32 second (~0.23 ns), below 1 ns resolution.
+		{0, 1 << 32, 0},
+		// frac = 0.25 s: bit 62 set (1/4).
+		{0, 1 << 62, 250_000_000},
+		// Combined whole seconds plus fraction.
+		{3, 1<<62 + 1<<63, 3_750_000_000},
+	}
+	for _, c := range cases {
+		if got := NetworkTimeNanoseconds(c.secs, c.frac); got != c.want {
+			t.Fatalf("NetworkTimeNanoseconds(%d, %d) = %d, want %d", c.secs, c.frac, got, c.want)
+		}
+	}
+}
