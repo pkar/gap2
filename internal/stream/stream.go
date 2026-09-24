@@ -11,12 +11,34 @@ import (
 	"github.com/pkar/gap2/pcm"
 )
 
+// aacFrameLen is the number of PCM samples in one AAC-LC frame (1024), used to
+// advance the RTP timestamp across access units packed into a single RTP
+// packet.
+const aacFrameLen = 1024
+
 // Decoder decodes one audio access unit into interleaved 16-bit PCM. The
 // concrete AAC-LC and ALAC implementations plug in here.
 type Decoder interface {
 	// Decode decodes au and returns a PCM block whose Format matches the
 	// stream format. Implementations may return a zero-length block.
 	Decode(au []byte) (pcm.Block, error)
+}
+
+// TimedSink is a Sink that additionally receives the source RTP timestamp of
+// the first frame in each block. Sinks that implement it can schedule playback
+// against a synchronized clock; IngestRTP prefers WriteTimed over Write.
+type TimedSink interface {
+	pcm.Sink
+	WriteTimed(ctx context.Context, frame uint32, block pcm.Block) error
+}
+
+// writeSink writes block to s.sink, routing through TimedSink when the sink
+// carries a source timestamp.
+func (s *Stream) writeSink(ctx context.Context, frame uint32, block pcm.Block) error {
+	if ts, ok := s.sink.(TimedSink); ok {
+		return ts.WriteTimed(ctx, frame, block)
+	}
+	return s.sink.Write(ctx, block)
 }
 
 // State is the coarse state of one media stream.
@@ -211,12 +233,14 @@ func (s *Stream) IngestRTP(ctx context.Context, pkt []byte) error {
 		if err != nil {
 			return err
 		}
-		for _, au := range aus {
+		// Consecutive AAC-LC access units are one frame (1024 samples) apart
+		// in RTP timestamp units.
+		for i, au := range aus {
 			block, err := s.decoder.Decode(au.Data)
 			if err != nil {
 				return err
 			}
-			if err := s.sink.Write(ctx, block); err != nil {
+			if err := s.writeSink(ctx, p.Timestamp+uint32(i)*aacFrameLen, block); err != nil {
 				return err
 			}
 		}
@@ -227,7 +251,7 @@ func (s *Stream) IngestRTP(ctx context.Context, pkt []byte) error {
 		if err != nil {
 			return err
 		}
-		return s.sink.Write(ctx, block)
+		return s.writeSink(ctx, p.Timestamp, block)
 	default:
 		return fmt.Errorf("stream: %w: %s ingest not implemented", ErrUnsupported, media.Encoding)
 	}

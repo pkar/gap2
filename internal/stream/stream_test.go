@@ -34,6 +34,28 @@ func (r *recordingSink) Flush(context.Context) error { return nil }
 func (r *recordingSink) Position() pcm.Position      { return pcm.Position{} }
 func (r *recordingSink) Close() error                { return nil }
 
+// timedSink records the RTP frame timestamps it is handed through the
+// TimedSink path, so tests can assert timestamp threading without a real clock.
+type timedSink struct {
+	frames []uint32
+	blocks []pcm.Block
+}
+
+func (r *timedSink) WriteTimed(_ context.Context, frame uint32, b pcm.Block) error {
+	r.frames = append(r.frames, frame)
+	r.blocks = append(r.blocks, b)
+	return nil
+}
+
+func (r *timedSink) Write(_ context.Context, b pcm.Block) error {
+	r.blocks = append(r.blocks, b)
+	return nil
+}
+
+func (r *timedSink) Flush(context.Context) error { return nil }
+func (r *timedSink) Position() pcm.Position      { return pcm.Position{} }
+func (r *timedSink) Close() error                { return nil }
+
 func aacMedia() *sdp.Media {
 	return &sdp.Media{
 		PayloadType: 96,
@@ -54,6 +76,16 @@ func rtpPacket(payload []byte) []byte {
 	p[0] = 0x80 // version 2
 	p[1] = 0x60 // payload type 96, no marker
 	return append(p, payload...)
+}
+
+// rtpPacketTS builds an RTP packet with an explicit 32-bit timestamp.
+func rtpPacketTS(payload []byte, ts uint32) []byte {
+	p := rtpPacket(payload)
+	p[4] = byte(ts >> 24)
+	p[5] = byte(ts >> 16)
+	p[6] = byte(ts >> 8)
+	p[7] = byte(ts)
+	return p
 }
 
 func TestStreamAACIngest(t *testing.T) {
@@ -85,6 +117,76 @@ func TestStreamAACIngest(t *testing.T) {
 	}
 	if !bytes.Equal(sink.blocks[0].Data, decoded.Data) {
 		t.Fatalf("block = %x, want %x", sink.blocks[0].Data, decoded.Data)
+	}
+}
+
+func TestStreamTimedSink(t *testing.T) {
+	decoded := pcm.Block{Format: pcm.Format{Rate: 44100, Channels: 2, Format: pcm.S16LE}, Data: []byte{0, 1, 2, 3}}
+	sink := &timedSink{}
+	s := New("1", stubDecoder{block: decoded}, sink)
+
+	if err := s.Announce(aacMedia()); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := ParseTransport("RTP/AVP/UDP;unicast;client_port=6000-6001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Setup(tr, 7000); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Record(); err != nil {
+		t.Fatal(err)
+	}
+
+	// One AAC AU, RTP timestamp 44100. The sink must receive exactly that
+	// frame timestamp through the TimedSink path.
+	payload := []byte{0x00, 0x10, 0x00, 0xc0, 0xaa, 0xbb, 0xcc}
+	if err := s.IngestRTP(context.Background(), rtpPacketTS(payload, 44100)); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.frames) != 1 || sink.frames[0] != 44100 {
+		t.Fatalf("frames = %v, want [44100]", sink.frames)
+	}
+	if len(sink.blocks) != 1 || !bytes.Equal(sink.blocks[0].Data, decoded.Data) {
+		t.Fatalf("blocks = %+v, want decoded block", sink.blocks)
+	}
+}
+
+func TestStreamTimedSinkMultiAU(t *testing.T) {
+	decoded := pcm.Block{Format: pcm.Format{Rate: 44100, Channels: 2, Format: pcm.S16LE}, Data: []byte{0, 1, 2, 3}}
+	sink := &timedSink{}
+	s := New("1", stubDecoder{block: decoded}, sink)
+
+	if err := s.Announce(aacMedia()); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := ParseTransport("RTP/AVP/UDP;unicast;client_port=6000-6001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Setup(tr, 7000); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Record(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two 3-byte AUs. Consecutive AAC-LC frames are 1024 samples apart, so the
+	// second AU must carry timestamp+1024.
+	payload := []byte{
+		0x00, 0x20, // AU-headers-length = 32 bits
+		0x00, 0xc0, // AU1: 24 bits, index 0
+		0x00, 0xc0, // AU2: 24 bits, index 0
+		0xaa, 0xbb, 0xcc,
+		0xdd, 0xee, 0xff,
+	}
+	if err := s.IngestRTP(context.Background(), rtpPacketTS(payload, 44100)); err != nil {
+		t.Fatal(err)
+	}
+	want := []uint32{44100, 44100 + 1024}
+	if len(sink.frames) != 2 || sink.frames[0] != want[0] || sink.frames[1] != want[1] {
+		t.Fatalf("frames = %v, want %v", sink.frames, want)
 	}
 }
 

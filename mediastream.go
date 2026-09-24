@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/pkar/gap2/internal/media"
+	"github.com/pkar/gap2/internal/playout"
 	"github.com/pkar/gap2/internal/plist"
 	"github.com/pkar/gap2/internal/ptp"
 	"github.com/pkar/gap2/internal/sdp"
@@ -100,7 +101,15 @@ func (h *mediaHandler) announce(cs *connState, req *ctlRequest) error {
 	}
 	h.sink = sink
 
-	sess, err := media.NewSession(streamID(req.target), m, sink)
+	// Wrap the output sink in a PTP-synchronized scheduler so decoded blocks
+	// are written at their anchor-derived presentation times rather than as
+	// soon as they are received.
+	out := sink
+	if h.clock != nil {
+		out = playout.NewSynced(sink, h.clock.FrameLocalTime, ptp.MonotonicNanos)
+	}
+
+	sess, err := media.NewSession(streamID(req.target), m, out)
 	if err != nil {
 		return cs.writeRTSPResponse(cseq, 415, "Unsupported Media Type", nil, nil)
 	}
