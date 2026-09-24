@@ -194,7 +194,7 @@ func (s *controlServer) infoValue() *plist.Value {
 		"pk":              plist.Data(s.identity.PublicKey()),
 		"protocolVersion": plist.String("1.1"),
 		"sourceVersion":   plist.String("366.0"),
-		"vv":              plist.Int(1),
+		"vv":              plist.Int(2),
 	})
 }
 

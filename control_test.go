@@ -137,7 +137,7 @@ func TestControlInfo(t *testing.T) {
 	if pk := v.Dict["pk"]; pk.Kind != plist.KindData || !slices.Equal(pk.Data, s.identity.PublicKey()) {
 		t.Fatalf("/info pk must be the advertised Ed25519 public key as plist data")
 	}
-	if v.Dict["pi"].String != string(s.identity.ID) || v.Dict["psi"].String != string(s.identity.ID) || v.Dict["vv"].Int != 1 {
+	if v.Dict["pi"].String != string(s.identity.ID) || v.Dict["psi"].String != string(s.identity.ID) || v.Dict["vv"].Int != 2 {
 		t.Fatal("/info identity or version disagrees with discovery")
 	}
 	features := v.Dict["features"]
@@ -167,7 +167,13 @@ func TestAirPlayFeaturesMatchImplementedAudio(t *testing.T) {
 	if !slices.Contains(txt, "pi="+string(s.identity.ID)) || !slices.Contains(txt, "pk="+hex.EncodeToString(s.identity.PublicKey())) {
 		t.Fatal("DNS-SD pairing ID or public key does not match HAP identity")
 	}
+	if !slices.Contains(txt, "vv=2") {
+		t.Fatal("AirPlay TXT version disagrees with /info")
+	}
 	raop := raopTXT(s.identity)
+	if !slices.Contains(raop, "vv=2") {
+		t.Fatal("RAOP TXT version disagrees with /info")
+	}
 	for _, field := range []string{
 		fmt.Sprintf("ft=0x%X,0x%X", uint32(airplayFeatures&0xffffffff), airplayFeatures>>32),
 		"sf=0x4", "et=0", "pk=" + hex.EncodeToString(s.identity.PublicKey()),

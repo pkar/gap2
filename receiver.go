@@ -366,7 +366,7 @@ func airplayTXT(mac string, identity hap.Identity) []string {
 		"psi=" + string(identity.ID),
 		"protovers=1.1",
 		"srcvers=366.0",
-		"vv=1",
+		"vv=2",
 	}
 }
 
@@ -390,6 +390,6 @@ func raopTXT(identity hap.Identity) []string {
 		"pk=" + hex.EncodeToString(identity.PublicKey()),
 		"vn=65537",
 		"vs=366.0",
-		"vv=1",
+		"vv=2",
 	}
 }
