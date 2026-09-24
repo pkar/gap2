@@ -76,18 +76,27 @@ func NewClock() *Clock { return &Clock{} }
 // HandleAnnounce records the grandmaster identity from an Announce message.
 // The clock identity is taken from the grandmasterIdentity field carried in
 // the Announce body (m.Grandmaster). The offset is reset if the grandmaster
-// changes, because the new master's epoch may differ.
+// changes, because the new master's epoch may differ. A genuine change from
+// one master to another also clears the playback anchor, whose
+// RTP-frame-to-grandmaster-time mapping refers to the old master's epoch and
+// is meaningless for the new one; the zero-to-first-master transition keeps
+// any anchor already recorded, since there is no prior epoch for it to be
+// stale against.
 func (c *Clock) HandleAnnounce(m Message) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if m.Grandmaster == c.masterID {
 		return
 	}
+	changed := c.masterID != [8]byte{}
 	c.masterID = m.Grandmaster
 	c.offsetNs = 0
 	c.raw = 0
 	c.valid = false
 	c.samples = 0
+	if changed {
+		c.anchorSet = false
+	}
 }
 
 // HandleSync records receipt of a Sync message. The offset is not updated

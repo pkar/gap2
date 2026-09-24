@@ -513,3 +513,34 @@ func TestHandleControlPacketZeroRate(t *testing.T) {
 		t.Fatal("anchor set for zero rate")
 	}
 }
+
+// TestHandleControlPacketClockMatch ensures a code-215 packet whose clock
+// matches the selected grandmaster is adopted.
+func TestHandleControlPacketClockMatch(t *testing.T) {
+	clock := ptp.NewClock()
+	clock.HandleAnnounce(ptp.Message{Grandmaster: testClockID})
+	h := &mediaHandler{log: slog.Default(), clock: clock}
+	h.handleControlPacket(ap2TimingPacket(1000, 5_000_000_000), 44100)
+
+	a, ok := clock.Anchor()
+	if !ok {
+		t.Fatal("anchor not set for matching clock")
+	}
+	if a.ClockID != testClockID {
+		t.Fatalf("anchor clockID = %x, want %x", a.ClockID, testClockID)
+	}
+}
+
+// TestHandleControlPacketClockMismatch ensures a code-215 packet for a clock
+// other than the selected grandmaster is rejected.
+func TestHandleControlPacketClockMismatch(t *testing.T) {
+	clock := ptp.NewClock()
+	master := [8]byte{0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88}
+	clock.HandleAnnounce(ptp.Message{Grandmaster: master})
+	h := &mediaHandler{log: slog.Default(), clock: clock}
+	h.handleControlPacket(ap2TimingPacket(1000, 5_000_000_000), 44100) // testClockID != master
+
+	if _, ok := clock.Anchor(); ok {
+		t.Fatal("anchor set despite clock mismatch")
+	}
+}

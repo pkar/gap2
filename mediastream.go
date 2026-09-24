@@ -350,6 +350,16 @@ func (h *mediaHandler) handleControlPacket(pkt []byte, rate int) {
 	if !ok || h.clock == nil || rate <= 0 {
 		return
 	}
+	// Cross-check the anchor's clock against the grandmaster the clock is
+	// synchronized to. An anchor for a different clock is stale and must not
+	// be adopted; the sender will re-announce against the new master. A zero
+	// master identity means no Announce has selected a master yet, so there is
+	// nothing to compare against and the anchor is accepted.
+	if master := h.clock.Info().MasterID; master != ([8]byte{}) && master != clockID {
+		h.log.Warn("AP2 control anchor clock mismatch",
+			"anchorClock", fmt.Sprintf("%x", clockID), "masterClock", fmt.Sprintf("%x", master))
+		return
+	}
 	// A changed clock identity means the sender switched grandmasters, so the
 	// anchor epoch has changed. Log it; the new anchor simply supersedes the
 	// old one, mirroring the reference's "Set Anchor Clock" transition.
