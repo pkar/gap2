@@ -55,10 +55,10 @@ func (h *mediaHandler) sendUpdateInfo(w io.Writer) error {
 }
 
 // readEventCommands reads and logs the remote-control commands the sender posts
-// over the event channel (for example updateInfo, updateAudioFormat, and
-// updateProgress). Commands are framed as "POST /command RTSP/1.0" requests
-// with binary-plist bodies. Received commands are currently acknowledged
-// implicitly by keeping the channel open; command handling is a future
+// over the event channel (for example setRate, setVolume, updateAudioFormat,
+// and updateProgress). Commands are framed as "POST /command RTSP/1.0"
+// requests with binary-plist bodies. Each body is decoded to its "type" for
+// observability; acting on the commands (rate/volume plumbing) is a future
 // extension.
 func (h *mediaHandler) readEventCommands(ec *hap.Conn) {
 	br := bufio.NewReader(ec)
@@ -70,8 +70,41 @@ func (h *mediaHandler) readEventCommands(ec *hap.Conn) {
 			}
 			return
 		}
-		h.log.Debug("event command", "method", req.method, "target", req.target, "body", len(req.body))
+		h.logEventCommand(req.body)
 	}
+}
+
+// logEventCommand decodes an event-channel command body and logs its type. It
+// is the observation point where setRate/setVolume handling will attach.
+func (h *mediaHandler) logEventCommand(body []byte) {
+	typ, _, err := decodeEventCommand(body)
+	if err != nil {
+		h.log.Debug("event command decode failed", "err", err, "bytes", len(body))
+		return
+	}
+	h.log.Debug("event command", "type", typ)
+}
+
+// decodeEventCommand decodes one event-channel command body, a binary plist
+// dict, and returns its "type" string and the type-specific "value" node (nil
+// when absent).
+func decodeEventCommand(body []byte) (string, *plist.Value, error) {
+	v, err := plist.Decode(body, plist.DefaultLimits())
+	if err != nil {
+		return "", nil, err
+	}
+	if v == nil || v.Kind != plist.KindDict {
+		return "", nil, fmt.Errorf("airplay2: event command body is not a dict")
+	}
+	typ, ok := v.Dict["type"]
+	if !ok || typ.Kind != plist.KindString {
+		return "", nil, fmt.Errorf("airplay2: event command missing type")
+	}
+	var val *plist.Value
+	if vv, ok := v.Dict["value"]; ok {
+		val = &vv
+	}
+	return typ.String, val, nil
 }
 
 // readEventRequest parses one event-channel command request using the same

@@ -81,3 +81,66 @@ func TestSendUpdateInfoNilInfo(t *testing.T) {
 		t.Fatalf("expected no output, got %d bytes", b.Len())
 	}
 }
+
+// TestDecodeEventCommand checks that a command body is decoded to its "type"
+// and "value" nodes.
+func TestDecodeEventCommand(t *testing.T) {
+	body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
+		"type":  plist.String("setRate"),
+		"value": plist.Real(1.0),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	typ, val, err := decodeEventCommand(body)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if typ != "setRate" {
+		t.Fatalf("type = %q, want setRate", typ)
+	}
+	if val == nil || val.Kind != plist.KindReal || val.Real != 1.0 {
+		t.Fatalf("value = %+v, want real 1.0", val)
+	}
+}
+
+// TestDecodeEventCommandNoValue covers a command body without a "value" key.
+func TestDecodeEventCommandNoValue(t *testing.T) {
+	body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
+		"type": plist.String("ping"),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	typ, val, err := decodeEventCommand(body)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if typ != "ping" {
+		t.Fatalf("type = %q, want ping", typ)
+	}
+	if val != nil {
+		t.Fatalf("value = %+v, want nil", val)
+	}
+}
+
+// TestDecodeEventCommandErrors covers malformed and non-dict bodies.
+func TestDecodeEventCommandErrors(t *testing.T) {
+	if _, _, err := decodeEventCommand([]byte("not a plist")); err == nil {
+		t.Fatal("expected error for malformed body")
+	}
+	body, err := plist.Encode(plist.String("not a dict"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := decodeEventCommand(body); err == nil {
+		t.Fatal("expected error for non-dict body")
+	}
+	body, err = plist.Encode(plist.Dict(map[string]*plist.Value{"nope": plist.Int(1)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := decodeEventCommand(body); err == nil {
+		t.Fatal("expected error for missing type")
+	}
+}
