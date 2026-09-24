@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/pkar/gap2/internal/hap"
+	"github.com/pkar/gap2/internal/ptp"
 	"github.com/pkar/gap2/internal/zeroconf"
 )
 
@@ -47,6 +48,13 @@ type Receiver struct {
 	ln           net.Listener
 	adv          *zeroconf.Advertiser
 
+	// ptpClock is the synchronized clock shared by the PTP listener and the
+	// media handlers. ptpGroup owns the live PTP sockets; ptpWG tracks the
+	// serve goroutine so shutdown can join it.
+	ptpClock *ptp.Clock
+	ptpGroup *ptp.Group
+	ptpWG    sync.WaitGroup
+
 	droppedEvents atomic.Int64
 }
 
@@ -58,10 +66,11 @@ func New(cfg Config) (*Receiver, error) {
 		return nil, err
 	}
 	return &Receiver{
-		cfg:    cfg,
-		log:    cfg.Logger,
-		events: make(chan Event, 64),
-		state:  StateIdle,
+		cfg:      cfg,
+		log:      cfg.Logger,
+		events:   make(chan Event, 64),
+		state:    StateIdle,
+		ptpClock: ptp.NewClock(),
 	}, nil
 }
 
@@ -84,8 +93,10 @@ func (r *Receiver) Run(ctx context.Context) (err error) {
 		r.mu.Lock()
 		ln := r.ln
 		adv := r.adv
+		ptpGroup := r.ptpGroup
 		r.ln = nil
 		r.adv = nil
+		r.ptpGroup = nil
 		r.mu.Unlock()
 		if ln != nil {
 			_ = ln.Close()
@@ -93,6 +104,10 @@ func (r *Receiver) Run(ctx context.Context) (err error) {
 		if adv != nil {
 			_ = adv.Close()
 		}
+		if ptpGroup != nil {
+			_ = ptpGroup.Close()
+		}
+		r.ptpWG.Wait()
 		if err != nil {
 			r.mu.Lock()
 			r.setStateLocked(StateFailed)
@@ -120,7 +135,9 @@ func (r *Receiver) Run(ctx context.Context) (err error) {
 	r.ln = ln
 	r.mu.Unlock()
 
-	s := newControlServer(r.cfg, identity, store)
+	s := newControlServer(r.cfg, identity, store, r.ptpClock)
+
+	r.startPTP(ctx)
 
 	adv, derr := startDiscovery(ctx, r.cfg, ln.Addr(), identity, store)
 	r.mu.Lock()
@@ -150,6 +167,27 @@ func (r *Receiver) Run(ctx context.Context) (err error) {
 // dropped events are counted in Status.
 func (r *Receiver) Events() <-chan Event {
 	return r.events
+}
+
+// startPTP joins the PTP multicast group and serves it into r.ptpClock. PTP
+// is best-effort: when multicast is unavailable the receiver still plays audio
+// but cannot synchronize its clock, which is logged rather than failing Run.
+func (r *Receiver) startPTP(ctx context.Context) {
+	group, err := ptp.ListenGroup(r.cfg.Interfaces, r.ptpClock)
+	if err != nil {
+		r.log.Warn("PTP listener unavailable", "err", err)
+		return
+	}
+	r.mu.Lock()
+	r.ptpGroup = group
+	r.mu.Unlock()
+	r.ptpWG.Add(1)
+	go func() {
+		defer r.ptpWG.Done()
+		if err := group.Serve(ctx); err != nil {
+			r.log.Debug("PTP serve ended", "err", err)
+		}
+	}()
 }
 
 // Addr returns the bound control address. It is nil before Run binds the
@@ -182,10 +220,12 @@ func (r *Receiver) Close() error {
 	r.mu.Lock()
 	var ln net.Listener
 	var adv *zeroconf.Advertiser
+	var ptpGroup *ptp.Group
 	if !r.closed {
 		r.closed = true
 		ln = r.ln
 		adv = r.adv
+		ptpGroup = r.ptpGroup
 		if r.state == StateIdle || r.state == StateStarting {
 			r.setStateLocked(StateStopped)
 		}
@@ -198,6 +238,10 @@ func (r *Receiver) Close() error {
 	if adv != nil {
 		_ = adv.Close()
 	}
+	if ptpGroup != nil {
+		_ = ptpGroup.Close()
+	}
+	r.ptpWG.Wait()
 
 	r.closeEvents()
 	return nil

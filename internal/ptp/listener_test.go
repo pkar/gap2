@@ -146,3 +146,39 @@ func TestListenerServeDispatch(t *testing.T) {
 		t.Fatal("Serve did not return after cancellation")
 	}
 }
+
+func TestGroupServeDispatch(t *testing.T) {
+	c := NewClock()
+	now := uint64(1000_000_000_000)
+	g := &Group{listeners: []*Listener{
+		newListener(newFakeConn(), c, func() uint64 { return now }),
+		newListener(newFakeConn(
+			Marshal(TypeFollowUp, 1, [8]byte{1}, Timestamp{Seconds: 1000, Nanos: 500}),
+		), c, func() uint64 { return now }),
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- g.Serve(ctx) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := c.Offset(); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("offset not set from served Follow_Up across group")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned %v, want nil on cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return after cancellation")
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pkar/gap2/internal/plist"
 	"github.com/pkar/gap2/pcm"
 )
 
@@ -38,7 +39,7 @@ func newTestMediaServer(t *testing.T, factory pcm.Factory) *controlServer {
 	}
 	cfg := DefaultConfig()
 	cfg.Output = factory
-	return newControlServer(cfg, id, store)
+	return newControlServer(cfg, id, store, nil)
 }
 
 const mediaAACBody = "v=0\r\n" +
@@ -151,7 +152,7 @@ func TestMediaAnnounceNoOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := newControlServer(DefaultConfig(), id, store) // Output nil
+	s := newControlServer(DefaultConfig(), id, store, nil) // Output nil
 
 	buf := &bytes.Buffer{}
 	cs := &connState{log: s.log, w: buf}
@@ -160,6 +161,87 @@ func TestMediaAnnounceNoOutput(t *testing.T) {
 	}
 	if got := buf.String(); !strings.Contains(got, "RTSP/1.0 503") {
 		t.Fatalf("no-output ANNOUNCE response = %q", got)
+	}
+}
+
+// TestMediaSetRateAnchor drives ANNOUNCE then SETRATEANCHORI and verifies the
+// playback anchor is recorded against the negotiated sample rate.
+func TestMediaSetRateAnchor(t *testing.T) {
+	factory := &mediaFactory{sink: &mediaRecordingSink{}}
+	s := newTestMediaServer(t, factory)
+	buf := &bytes.Buffer{}
+	cs := &connState{log: s.log, w: buf}
+
+	if err := s.handleMedia(cs, mediaRequest("ANNOUNCE", "rtsp://host/1", "1", nil, mediaAACBody)); err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+
+	body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
+		"rtpTime":         plist.Int(88200),
+		"networkTimeSecs": plist.Int(1000),
+		"networkTimeFrac": plist.Int(1 << 62), // 0.25s
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.handleMedia(cs, mediaRequest("SETRATEANCHORI", "rtsp://host/1", "2", nil, string(body))); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); !strings.Contains(got, "RTSP/1.0 200 OK") {
+		t.Fatalf("SETRATEANCHORI response = %q", got)
+	}
+
+	a, ok := s.clock.Anchor()
+	if !ok {
+		t.Fatal("anchor not set")
+	}
+	if a.Frame != 88200 {
+		t.Fatalf("anchor frame = %d, want 88200", a.Frame)
+	}
+	if a.Rate != 44100 {
+		t.Fatalf("anchor rate = %d, want 44100", a.Rate)
+	}
+	// networkTimeSecs=1000, networkTimeFrac=1<<62 (0.25s) -> 1000.25s in ns.
+	if want := uint64(1000_250_000_000); a.MasterNs != want {
+		t.Fatalf("anchor master ns = %d, want %d", a.MasterNs, want)
+	}
+}
+
+// TestMediaSetRateAnchorBadBody covers malformed and missing-field bodies.
+func TestMediaSetRateAnchorBadBody(t *testing.T) {
+	factory := &mediaFactory{sink: &mediaRecordingSink{}}
+	s := newTestMediaServer(t, factory)
+	buf := &bytes.Buffer{}
+	cs := &connState{log: s.log, w: buf}
+
+	if err := s.handleMedia(cs, mediaRequest("ANNOUNCE", "rtsp://host/1", "1", nil, mediaAACBody)); err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+
+	// Malformed plist body.
+	if err := s.handleMedia(cs, mediaRequest("SETRATEANCHORI", "rtsp://host/1", "2", nil, "\x00not-a-plist")); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); !strings.Contains(got, "RTSP/1.0 400") {
+		t.Fatalf("malformed SETRATEANCHORI response = %q", got)
+	}
+	buf.Reset()
+
+	// Missing rtpTime field.
+	body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
+		"networkTimeSecs": plist.Int(1000),
+		"networkTimeFrac": plist.Int(0),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.handleMedia(cs, mediaRequest("SETRATEANCHORI", "rtsp://host/1", "3", nil, string(body))); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); !strings.Contains(got, "RTSP/1.0 400") {
+		t.Fatalf("missing-field SETRATEANCHORI response = %q", got)
 	}
 }
 

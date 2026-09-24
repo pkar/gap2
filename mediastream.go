@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/pkar/gap2/internal/media"
+	"github.com/pkar/gap2/internal/plist"
+	"github.com/pkar/gap2/internal/ptp"
 	"github.com/pkar/gap2/internal/sdp"
 	"github.com/pkar/gap2/internal/stream"
 	"github.com/pkar/gap2/pcm"
@@ -20,6 +22,7 @@ type mediaHandler struct {
 	log    *slog.Logger
 	ctx    context.Context
 	cancel context.CancelFunc
+	clock  *ptp.Clock
 
 	sess *media.Session
 	sink pcm.Sink
@@ -28,9 +31,9 @@ type mediaHandler struct {
 	bind func(network, addr string) (int, error)
 }
 
-func newMediaHandler(cfg Config, log *slog.Logger) *mediaHandler {
+func newMediaHandler(cfg Config, log *slog.Logger, clock *ptp.Clock) *mediaHandler {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &mediaHandler{cfg: cfg, log: log, ctx: ctx, cancel: cancel}
+	return &mediaHandler{cfg: cfg, log: log, ctx: ctx, cancel: cancel, clock: clock}
 }
 
 // close cancels any active serve loop and releases the receiver and sink. It
@@ -52,7 +55,7 @@ func (h *mediaHandler) close() {
 // connection.
 func (s *controlServer) handleMedia(cs *connState, req *ctlRequest) error {
 	if cs.media == nil {
-		cs.media = newMediaHandler(s.cfg, s.log)
+		cs.media = newMediaHandler(s.cfg, s.log, s.clock)
 	}
 	h := cs.media
 
@@ -67,7 +70,9 @@ func (s *controlServer) handleMedia(cs *connState, req *ctlRequest) error {
 		return h.teardown(cs, req)
 	case "FLUSH", "FLUSHBUFFERED":
 		return h.flush(cs, req)
-	case "GET_PARAMETER", "SET_PARAMETER", "SETRATEANCHORTIME", "SETPEERS", "SETPEERSX":
+	case "SETRATEANCHORI", "SETRATEANCHORTI":
+		return h.setRateAnchor(cs, req)
+	case "GET_PARAMETER", "SET_PARAMETER", "SETPEERS", "SETPEERSX":
 		return cs.writeRTSPResponse(reqHeader(req, "CSeq"), 200, "OK", nil, nil)
 	default:
 		return cs.writeRTSPResponse(reqHeader(req, "CSeq"), 501, "Not Implemented", nil, nil)
@@ -171,6 +176,59 @@ func (h *mediaHandler) flush(cs *connState, req *ctlRequest) error {
 		_ = h.sink.Flush(h.ctx)
 	}
 	return cs.writeRTSPResponse(cseq, 200, "OK", nil, nil)
+}
+
+// setRateAnchor handles SETRATEANCHORI/SETRATEANCHORTI. The body is a plist
+// carrying an RTP timestamp and the grandmaster time at which that frame will
+// be presented; together with the negotiated sample rate they form the
+// playback anchor used to schedule frames against the synchronized clock.
+func (h *mediaHandler) setRateAnchor(cs *connState, req *ctlRequest) error {
+	cseq := reqHeader(req, "CSeq")
+	if h.sess == nil {
+		return cs.writeRTSPResponse(cseq, 455, "Method Not Valid in This State", nil, nil)
+	}
+
+	v, err := plist.Decode(req.body, plist.DefaultLimits())
+	if err != nil || v.Kind != plist.KindDict {
+		h.log.Debug("SETRATEANCHORI plist invalid", "err", err)
+		return cs.writeRTSPResponse(cseq, 400, "Bad Request", nil, nil)
+	}
+
+	rtpTime, ok := plistInt(v, "rtpTime")
+	if !ok {
+		return cs.writeRTSPResponse(cseq, 400, "Bad Request", nil, nil)
+	}
+	secs, ok := plistInt(v, "networkTimeSecs")
+	if !ok {
+		return cs.writeRTSPResponse(cseq, 400, "Bad Request", nil, nil)
+	}
+	frac, ok := plistInt(v, "networkTimeFrac")
+	if !ok {
+		return cs.writeRTSPResponse(cseq, 400, "Bad Request", nil, nil)
+	}
+
+	anchor := ptp.Anchor{
+		Frame:    uint32(rtpTime),
+		MasterNs: ptp.NetworkTimeNanoseconds(uint64(secs), uint64(frac)),
+		Rate:     h.sess.Stream().Format().Rate,
+	}
+	if h.clock != nil {
+		h.clock.SetAnchor(anchor)
+	}
+
+	return cs.writeRTSPResponse(cseq, 200, "OK", nil, nil)
+}
+
+// plistInt extracts an integer value for key from a plist dictionary.
+func plistInt(v *plist.Value, key string) (int64, bool) {
+	if v == nil || v.Kind != plist.KindDict {
+		return 0, false
+	}
+	item, ok := v.Dict[key]
+	if !ok || item.Kind != plist.KindInt {
+		return 0, false
+	}
+	return item.Int, true
 }
 
 // streamID extracts the stream identifier from an RTSP target URL, defaulting

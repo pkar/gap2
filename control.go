@@ -17,6 +17,7 @@ import (
 
 	"github.com/pkar/gap2/internal/hap"
 	"github.com/pkar/gap2/internal/plist"
+	"github.com/pkar/gap2/internal/ptp"
 )
 
 // controlServer serves the AirPlay control endpoint: discovery info, pairing,
@@ -27,10 +28,14 @@ type controlServer struct {
 	identity hap.Identity
 	store    *pairingStore
 	pin      string
+	clock    *ptp.Clock
 }
 
-func newControlServer(cfg Config, id hap.Identity, store *pairingStore) *controlServer {
-	return &controlServer{cfg: cfg, log: cfg.Logger, identity: id, store: store, pin: cfg.PIN}
+func newControlServer(cfg Config, id hap.Identity, store *pairingStore, clock *ptp.Clock) *controlServer {
+	if clock == nil {
+		clock = ptp.NewClock()
+	}
+	return &controlServer{cfg: cfg, log: cfg.Logger, identity: id, store: store, pin: cfg.PIN, clock: clock}
 }
 
 // serve accepts connections until ln is closed or ctx is cancelled, then waits
@@ -117,7 +122,7 @@ func (s *controlServer) handleRequest(cs *connState, req *ctlRequest) error {
 			return s.handlePairVerify(cs, req)
 		}
 	case "ANNOUNCE", "SETUP", "RECORD", "TEARDOWN", "FLUSH", "FLUSHBUFFERED",
-		"GET_PARAMETER", "SET_PARAMETER", "SETRATEANCHORTIME", "SETPEERS", "SETPEERSX":
+		"GET_PARAMETER", "SET_PARAMETER", "SETRATEANCHORI", "SETRATEANCHORTI", "SETPEERS", "SETPEERSX":
 		if cs.encrypted == nil {
 			return cs.writeResponse(401, "Unauthorized", "text/plain", nil)
 		}

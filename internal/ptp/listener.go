@@ -3,6 +3,7 @@ package ptp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"time"
 )
@@ -103,3 +104,120 @@ func (l *Listener) handle(pkt []byte) {
 
 // Close closes the underlying connection, unblocking any in-progress Serve.
 func (l *Listener) Close() error { return l.conn.Close() }
+
+// ptpMulticast is the IPv4 PTP primary-domain multicast address (IEEE
+// 1588-2008 Annex F, domain 0). AirPlay senders multicast Sync on port 319 and
+// Follow_Up/Announce on port 320 to this group.
+var ptpMulticast = net.IPv4(224, 0, 1, 129)
+
+// ListenMulticast joins the PTP multicast group on the given interface and
+// port, returning a Listener that updates c.
+func ListenMulticast(iface *net.Interface, port int, c *Clock) (*Listener, error) {
+	if c == nil {
+		return nil, errors.New("ptp: nil clock")
+	}
+	conn, err := net.ListenMulticastUDP("udp4", iface, &net.UDPAddr{
+		IP:   ptpMulticast,
+		Port: port,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return newListener(conn, c, MonotonicNanos), nil
+}
+
+// Group is a set of Listeners bound to the standard PTP ports across one or
+// more interfaces, all feeding a single Clock.
+type Group struct {
+	listeners []*Listener
+}
+
+// ListenGroup joins the PTP multicast group on ports 319 and 320 for each
+// named interface, or for every up, multicast-capable interface when ifaces is
+// empty. If any socket fails to bind, the partially opened sockets are closed
+// and the error is returned.
+func ListenGroup(ifaces []string, c *Clock) (*Group, error) {
+	if c == nil {
+		return nil, errors.New("ptp: nil clock")
+	}
+	selected, err := multicastInterfaces(ifaces)
+	if err != nil {
+		return nil, err
+	}
+	g := &Group{}
+	for _, ifc := range selected {
+		for _, port := range []int{319, 320} {
+			l, err := ListenMulticast(ifc, port, c)
+			if err != nil {
+				_ = g.Close()
+				return nil, fmt.Errorf("ptp: listen %s:%d: %w", ifc.Name, port, err)
+			}
+			g.listeners = append(g.listeners, l)
+		}
+	}
+	return g, nil
+}
+
+// Serve reads PTP messages from every socket until ctx is cancelled, all
+// sockets are closed, or one returns an error. A nil return means clean
+// shutdown. The first non-nil error is returned after the remaining sockets
+// are stopped.
+func (g *Group) Serve(ctx context.Context) error {
+	if len(g.listeners) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errs := make(chan error, len(g.listeners))
+	for _, l := range g.listeners {
+		l := l
+		go func() { errs <- l.Serve(ctx) }()
+	}
+	var first error
+	for range g.listeners {
+		if err := <-errs; err != nil && first == nil {
+			first = err
+			cancel()
+		}
+	}
+	return first
+}
+
+// Close closes every socket and is idempotent.
+func (g *Group) Close() error {
+	var first error
+	for _, l := range g.listeners {
+		if err := l.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// multicastInterfaces resolves interface names or, when empty, returns every
+// up, multicast-capable interface.
+func multicastInterfaces(ifaces []string) ([]*net.Interface, error) {
+	if len(ifaces) > 0 {
+		out := make([]*net.Interface, 0, len(ifaces))
+		for _, name := range ifaces {
+			ifc, err := net.InterfaceByName(name)
+			if err != nil {
+				return nil, fmt.Errorf("ptp: interface %s: %w", name, err)
+			}
+			out = append(out, ifc)
+		}
+		return out, nil
+	}
+	all, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("ptp: list interfaces: %w", err)
+	}
+	var out []*net.Interface
+	for i := range all {
+		if all[i].Flags&net.FlagUp != 0 && all[i].Flags&net.FlagMulticast != 0 {
+			out = append(out, &all[i])
+		}
+	}
+	return out, nil
+}

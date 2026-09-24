@@ -24,7 +24,7 @@ func newTestControlServer(t *testing.T) *controlServer {
 		t.Fatal(err)
 	}
 	cfg := DefaultConfig()
-	return newControlServer(cfg, id, store)
+	return newControlServer(cfg, id, store, nil)
 }
 
 func startPipeConn(t *testing.T, s *controlServer) net.Conn {
