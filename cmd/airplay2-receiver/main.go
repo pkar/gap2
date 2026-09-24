@@ -17,7 +17,10 @@ import (
 	airplay2 "github.com/pkar/gap2"
 )
 
-const version = "0.1.0-dev"
+// version is the build version. It is a var so release builds can override it
+// with -ldflags "-X main.version=<version>"; the default marks a development
+// build.
+var version = "0.1.0-dev"
 
 // stringSlice collects repeated flag values.
 type stringSlice []string

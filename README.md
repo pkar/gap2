@@ -5,13 +5,13 @@ module and a standalone command that wraps the same API.
 
 ## Status
 
-**In progress.** The public lifecycle, pairing, discovery, and PCM contracts
-plus deterministic protocol-building blocks are implemented and tested.
-Discovery, HAP pairing, and the encrypted control transport are committed.
-Buffered playback is partially implemented: ADTS framing and a realtime PCM
-playout scheduler exist, but AAC-LC bitstream decoding and the RTSP media
-session are not implemented yet and are reported as such rather than
-simulated.
+**In progress.** The receiver library is importable and the standalone command
+runs. Implemented and tested: discovery (mDNS/DNS-SD), HAP pairing and the
+encrypted control transport, RTSP/SDP/RTP media transport, AAC-LC and ALAC
+decoding, a realtime PCM playout scheduler, PTP synchronization, and
+PTP-anchored playback. The AirPlay 2 plist-based SETUP negotiation is not yet
+complete, so end-to-end playback from real AirPlay 2 senders is not yet wired;
+the remaining pieces are reported as such rather than simulated.
 
 ## Layout
 
@@ -38,13 +38,25 @@ changed with a single `go.mod` edit plus import-path rewrites.
 ## Build and test
 
 ```sh
+make build          # build ./airplay2-receiver (CGO_ENABLED=0)
+make test           # go test ./...
+make vet            # go vet ./...
+make cross          # cross-build linux/amd64, linux/arm64, darwin/arm64 into dist/
+make install        # install to ~/.local/bin (override with BINDIR= or PREFIX=)
+```
+
+Equivalent raw Go commands:
+
+```sh
 CGO_ENABLED=0 go test ./...
 CGO_ENABLED=0 go vet ./...
 CGO_ENABLED=0 go build ./cmd/airplay2-receiver
 ```
 
 The production contract is cgo-free; the suite also runs under `go test -race`
-in a cgo-enabled environment when available.
+in a cgo-enabled environment when available. The `version` subcommand reports
+the build version, which release builds set via
+`-ldflags "-X main.version=<version>"`.
 
 ## License
 
