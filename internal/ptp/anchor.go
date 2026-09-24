@@ -11,6 +11,12 @@ type Anchor struct {
 	MasterNs uint64
 	// Rate is the sample rate in Hz.
 	Rate int
+	// ClockID is the grandmaster clock identity the anchor refers to. It is
+	// carried by code-215 timing-sync packets and lets the receiver detect a
+	// grandmaster change: an anchor for a different clock than the one the
+	// receiver is synchronized to must not be trusted. It is zero for anchors
+	// set by SETRATEANCHORI, which carries no clock identity.
+	ClockID [8]byte
 }
 
 // MasterTime returns the grandmaster time, in nanoseconds, at which the RTP

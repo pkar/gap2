@@ -428,44 +428,58 @@ func TestServeControlNil(t *testing.T) {
 	h.serveControl(nil, 44100)
 }
 
+// testClockID is a fixed grandmaster clock identity used in code-215 packets.
+var testClockID = [8]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
+
 // ap2TimingPacket builds a synthetic code-215 anchoring announcement with the
-// given frame and grandmaster time.
+// given frame, grandmaster time, and a fixed clock identity.
 func ap2TimingPacket(frame uint32, masterNs uint64) []byte {
+	return ap2TimingPacketClock(frame, masterNs, testClockID)
+}
+
+// ap2TimingPacketClock builds a synthetic code-215 announcement with an
+// explicit clock identity.
+func ap2TimingPacketClock(frame uint32, masterNs uint64, clockID [8]byte) []byte {
 	pkt := make([]byte, 28)
 	pkt[1] = ap2TimingSyncCode
 	binary.BigEndian.PutUint32(pkt[4:8], frame)
 	binary.BigEndian.PutUint64(pkt[8:16], masterNs)
+	copy(pkt[20:28], clockID[:])
 	return pkt
 }
 
 // TestAp2ControlAnchor parses a code-215 packet and checks the extracted
-// frame/grandmaster mapping, plus rejection of short and wrong-type packets.
+// frame/grandmaster/clock mapping, plus rejection of short and wrong-type
+// packets.
 func TestAp2ControlAnchor(t *testing.T) {
 	pkt := ap2TimingPacket(0x11223344, 0x8877665544332211)
-	frame, masterNs, ok := ap2ControlAnchor(pkt)
+	frame, masterNs, clockID, ok := ap2ControlAnchor(pkt)
 	if !ok {
 		t.Fatal("ap2ControlAnchor rejected a valid timing-sync packet")
 	}
 	if frame != 0x11223344 || masterNs != 0x8877665544332211 {
 		t.Fatalf("anchor = (%#x, %#x), want (0x11223344, 0x8877665544332211)", frame, masterNs)
 	}
+	if clockID != testClockID {
+		t.Fatalf("clockID = %x, want %x", clockID, testClockID)
+	}
 
-	if _, _, ok := ap2ControlAnchor(nil); ok {
+	if _, _, _, ok := ap2ControlAnchor(nil); ok {
 		t.Fatal("ap2ControlAnchor accepted a nil packet")
 	}
-	short := ap2TimingPacket(1, 2)[:15]
-	if _, _, ok := ap2ControlAnchor(short); ok {
+	short := ap2TimingPacket(1, 2)[:27]
+	if _, _, _, ok := ap2ControlAnchor(short); ok {
 		t.Fatal("ap2ControlAnchor accepted a short packet")
 	}
 	wrong := ap2TimingPacket(1, 2)
 	wrong[1] = ap2TimingSyncCode + 1
-	if _, _, ok := ap2ControlAnchor(wrong); ok {
+	if _, _, _, ok := ap2ControlAnchor(wrong); ok {
 		t.Fatal("ap2ControlAnchor accepted a wrong-type packet")
 	}
 }
 
 // TestHandleControlPacket verifies that a code-215 packet updates the clock
-// anchor.
+// anchor, recording the clock identity.
 func TestHandleControlPacket(t *testing.T) {
 	clock := ptp.NewClock()
 	h := &mediaHandler{log: slog.Default(), clock: clock}
@@ -477,6 +491,9 @@ func TestHandleControlPacket(t *testing.T) {
 	}
 	if a.Frame != 1000 || a.MasterNs != 5_000_000_000 || a.Rate != 44100 {
 		t.Fatalf("anchor = %+v, want frame 1000 master 5000000000 rate 44100", a)
+	}
+	if a.ClockID != testClockID {
+		t.Fatalf("anchor clockID = %x, want %x", a.ClockID, testClockID)
 	}
 }
 

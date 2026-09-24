@@ -341,19 +341,29 @@ func (h *mediaHandler) serveControl(conn net.PacketConn, rate int) {
 // handleControlPacket processes one AP2 control-port datagram. A code-215
 // timing-sync packet carries the playback anchor (the RTP frame playing at a
 // given grandmaster time) and continuously refreshes the anchor set by
-// SETRATEANCHORI, correcting drift. It is a no-op without a synchronized
-// clock or a positive sample rate.
+// SETRATEANCHORI, correcting drift. The packet also names the grandmaster
+// clock it refers to; a change in that identity is logged as a grandmaster
+// change. It is a no-op without a synchronized clock or a positive sample
+// rate.
 func (h *mediaHandler) handleControlPacket(pkt []byte, rate int) {
-	frame, masterNs, ok := ap2ControlAnchor(pkt)
+	frame, masterNs, clockID, ok := ap2ControlAnchor(pkt)
 	if !ok || h.clock == nil || rate <= 0 {
 		return
 	}
-	h.clock.SetAnchor(ptp.Anchor{Frame: frame, MasterNs: masterNs, Rate: rate})
-	h.log.Debug("AP2 control anchor", "frame", frame, "masterNs", masterNs)
+	// A changed clock identity means the sender switched grandmasters, so the
+	// anchor epoch has changed. Log it; the new anchor simply supersedes the
+	// old one, mirroring the reference's "Set Anchor Clock" transition.
+	if prev, set := h.clock.Anchor(); set && prev.ClockID != ([8]byte{}) && prev.ClockID != clockID {
+		h.log.Info("AP2 control anchor clock change",
+			"from", fmt.Sprintf("%x", prev.ClockID), "to", fmt.Sprintf("%x", clockID))
+	}
+	h.clock.SetAnchor(ptp.Anchor{Frame: frame, MasterNs: masterNs, Rate: rate, ClockID: clockID})
+	h.log.Debug("AP2 control anchor", "frame", frame, "masterNs", masterNs, "clockID", fmt.Sprintf("%x", clockID))
 }
 
 // ap2ControlAnchor parses a code-215 anchoring announcement and returns the
-// RTP frame that plays at the given grandmaster time. The packet layout is:
+// RTP frame that plays at the given grandmaster time together with the
+// grandmaster clock identity. The packet layout is:
 //
 //	offset 1        packet type code (215 for a timing-sync announcement)
 //	offset 4..8     frame (uint32 BE): the RTP timestamp due to play at the
@@ -361,16 +371,24 @@ func (h *mediaHandler) handleControlPacket(pkt []byte, rate int) {
 //	                stream latency into this value.
 //	offset 8..16    masterNs (uint64 BE): the grandmaster time, in
 //	                nanoseconds, at which frame plays.
+//	offset 16..20   frame2 (uint32 BE): the frame the time refers to; the
+//	                reference derives stream_specified_latency = frame2-frame
+//	                (normally 77175) from it but anchors on frame directly.
+//	offset 20..28   clockID ([8]byte BE): the grandmaster clock identity.
 //
 // ok is false when the packet is too short or is not a timing-sync packet.
-// The reference additionally subtracts a small output-backend latency fudge
-// factor from frame; gap2's playout scheduler buffers independently, so the
-// sender's value is used directly.
-func ap2ControlAnchor(pkt []byte) (frame uint32, masterNs uint64, ok bool) {
-	if len(pkt) < 16 || pkt[1] != ap2TimingSyncCode {
-		return 0, 0, false
+// The reference additionally subtracts a 11025-frame (250 ms at 44.1 kHz)
+// output-backend latency fudge factor from frame; gap2's playout scheduler
+// buffers independently, so the sender's value is used directly. That fudge
+// factor is the first thing to revisit if interop reveals a fixed offset.
+func ap2ControlAnchor(pkt []byte) (frame uint32, masterNs uint64, clockID [8]byte, ok bool) {
+	if len(pkt) < 28 || pkt[1] != ap2TimingSyncCode {
+		return 0, 0, [8]byte{}, false
 	}
-	return binary.BigEndian.Uint32(pkt[4:8]), binary.BigEndian.Uint64(pkt[8:16]), true
+	frame = binary.BigEndian.Uint32(pkt[4:8])
+	masterNs = binary.BigEndian.Uint64(pkt[8:16])
+	copy(clockID[:], pkt[20:28])
+	return frame, masterNs, clockID, true
 }
 
 // localIP returns the local IP of a connection as a string, used to populate
