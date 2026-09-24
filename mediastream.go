@@ -5,10 +5,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
+	"github.com/pkar/gap2/internal/hap"
 	"github.com/pkar/gap2/internal/media"
 	"github.com/pkar/gap2/internal/playout"
 	"github.com/pkar/gap2/internal/plist"
@@ -28,8 +31,15 @@ type mediaHandler struct {
 	cancel context.CancelFunc
 	clock  *ptp.Clock
 
-	sess *media.Session
-	sink pcm.Sink
+	sess            *media.Session
+	sink            pcm.Sink
+	volume          float64
+	gain            *pcm.Gain
+	playout         *playout.Synced
+	recordRequested bool
+	mediaStarted    bool
+	mediaCancel     context.CancelFunc
+	streamType      int64
 
 	// info supplies the receiver info dictionary pushed as the event-channel
 	// updateInfo; it is injected from the control server after pairing.
@@ -74,20 +84,35 @@ func (h *mediaHandler) close() {
 		h.cancel()
 		h.cancel = nil
 	}
-	if h.sess != nil {
-		_ = h.sess.Close()
-	}
-	if h.sink != nil {
-		_ = h.sink.Close()
-	}
+	h.closeAudio()
 	if h.eventLn != nil {
 		_ = h.eventLn.Close()
 		h.eventLn = nil
+	}
+}
+
+// closeAudio releases only the stream. AP2 keeps control, pairing, and the
+// event connection alive when a TEARDOWN names entries in "streams".
+func (h *mediaHandler) closeAudio() {
+	if h.mediaCancel != nil {
+		h.mediaCancel()
+		h.mediaCancel = nil
+	}
+	if h.sess != nil {
+		_ = h.sess.Stream().Teardown()
+		_ = h.sess.Close()
+		h.sess = nil
+	}
+	if h.sink != nil {
+		_ = h.sink.Close()
+		h.sink = nil
 	}
 	if h.controlConn != nil {
 		_ = h.controlConn.Close()
 		h.controlConn = nil
 	}
+	h.gain, h.playout = nil, nil
+	h.mediaStarted, h.streamType = false, 0
 }
 
 // handleMedia dispatches one RTSP media request on an encrypted control
@@ -110,9 +135,27 @@ func (s *controlServer) handleMedia(cs *connState, req *ctlRequest) error {
 		return h.teardown(cs, req)
 	case "FLUSH", "FLUSHBUFFERED":
 		return h.flush(cs, req)
-	case "SETRATEANCHORI", "SETRATEANCHORTI":
+	case "SETRATEANCHORI", "SETRATEANCHORTI", "SETRATEANCHORTIME":
 		return h.setRateAnchor(cs, req)
-	case "GET_PARAMETER", "SET_PARAMETER", "SETPEERS", "SETPEERSX":
+	case "GET_PARAMETER":
+		if strings.TrimSpace(string(req.body)) == "volume" {
+			return cs.writeRTSPResponse(reqHeader(req, "CSeq"), 200, "OK",
+				map[string]string{"Content-Type": "text/parameters"}, []byte(fmt.Sprintf("volume: %.6f\r\n", h.volume)))
+		}
+		return cs.writeRTSPResponse(reqHeader(req, "CSeq"), 200, "OK", nil, nil)
+	case "SET_PARAMETER":
+		if value, ok := strings.CutPrefix(strings.TrimSpace(string(req.body)), "volume:"); ok {
+			volume, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+			if err != nil || math.IsNaN(volume) || math.IsInf(volume, 0) || volume > 0 || volume < -144 {
+				return cs.writeError(400, "Bad Request")
+			}
+			h.volume = volume
+			if h.gain != nil {
+				h.gain.SetDB(volume)
+			}
+		}
+		return cs.writeRTSPResponse(reqHeader(req, "CSeq"), 200, "OK", nil, nil)
+	case "SETPEERS", "SETPEERSX", "LOUDNESSNORMALIZATION":
 		return cs.writeRTSPResponse(reqHeader(req, "CSeq"), 200, "OK", nil, nil)
 	default:
 		return cs.writeRTSPResponse(reqHeader(req, "CSeq"), 501, "Not Implemented", nil, nil)
@@ -145,14 +188,16 @@ func (h *mediaHandler) announce(cs *connState, req *ctlRequest) error {
 		h.log.Debug("media sink open failed", "err", err)
 		return cs.writeRTSPResponse(cseq, 500, "Internal Server Error", nil, nil)
 	}
-	h.sink = sink
+	h.gain = pcm.NewGain(sink, h.volume)
+	h.sink = h.gain
 
 	// Wrap the output sink in a PTP-synchronized scheduler so decoded blocks
 	// are written at their anchor-derived presentation times rather than as
 	// soon as they are received.
-	out := sink
+	var out pcm.Sink = h.gain
 	if h.clock != nil {
-		out = playout.NewSynced(sink, h.clock.FrameLocalTime, ptp.MonotonicNanos)
+		h.playout = playout.NewSynced(h.gain, h.clock.FrameLocalTime, ptp.MonotonicNanos)
+		out = h.playout
 	}
 
 	sess, err := media.NewSession(streamID(req.target), m, out)
@@ -163,6 +208,9 @@ func (h *mediaHandler) announce(cs *connState, req *ctlRequest) error {
 		return cs.writeRTSPResponse(cseq, 400, "Bad Request", nil, nil)
 	}
 	h.sess = sess
+	if h.clock != nil {
+		h.clock.ClearAnchor()
+	}
 
 	return cs.writeRTSPResponse(cseq, 200, "OK", nil, nil)
 }
@@ -176,6 +224,8 @@ func (h *mediaHandler) setup(cs *connState, req *ctlRequest) error {
 	if len(req.body) > 0 {
 		if s, err := parseAp2Setup(req.body); err == nil {
 			return h.setupAp2(cs, cseq, s)
+		} else {
+			h.log.Debug("AP2 SETUP parse failed", "err", err)
 		}
 	}
 
@@ -257,16 +307,13 @@ func (h *mediaHandler) setupInitialAp2(cs *connState, cseq string, s *ap2SetupRe
 }
 
 // setupStreamAp2 answers the media SETUP: it selects a supported stream type
-// (realtime UDP audio), binds the RTP data and AP2 control ports, and returns
+// (realtime UDP or buffered TCP audio), binds the data and AP2 control ports, and returns
 // them in the streams array.
 func (h *mediaHandler) setupStreamAp2(cs *connState, cseq string, s *ap2SetupRequest) error {
-	if h.sess == nil {
-		return cs.writeRTSPResponse(cseq, 455, "Method Not Valid in This State", nil, nil)
-	}
-
+	h.log.Debug("AP2 requested streams", "types", s.streamTypes)
 	var stype int64 = -1
 	for _, t := range s.streamTypes {
-		if t == ap2StreamRealtime {
+		if t == ap2StreamRealtime || t == ap2StreamBuffered {
 			stype = t
 			break
 		}
@@ -274,12 +321,32 @@ func (h *mediaHandler) setupStreamAp2(cs *connState, cseq string, s *ap2SetupReq
 	if stype < 0 {
 		return cs.writeRTSPResponse(cseq, 415, "Unsupported Media Type", nil, nil)
 	}
+	if h.sess == nil {
+		for _, entry := range s.streams {
+			if entry.Dict["type"].Int == stype {
+				if err := h.openNativeStream(entry); err != nil {
+					h.log.Debug("AP2 stream rejected", "err", err)
+					return cs.writeRTSPResponse(cseq, 415, "Unsupported Media Type", nil, nil)
+				}
+				break
+			}
+		}
+		if h.sess == nil {
+			return cs.writeRTSPResponse(cseq, 455, "Method Not Valid in This State", nil, nil)
+		}
+	}
 
 	bind := h.bind
 	if bind == nil {
 		bind = h.sess.Bind
 	}
-	dataPort, err := bind("udp4", ":0")
+	network, protocol := "udp4", "RTP/AVP/UDP"
+	var bufferSize uint32
+	if stype == ap2StreamBuffered {
+		network, protocol = "tcp4", "RTP/AVP/TCP"
+		bufferSize = media.BufferedAudioBytes
+	}
+	dataPort, err := bind(network, ":0")
 	if err != nil {
 		h.log.Debug("media bind failed", "err", err)
 		return cs.writeRTSPResponse(cseq, 500, "Internal Server Error", nil, nil)
@@ -287,10 +354,11 @@ func (h *mediaHandler) setupStreamAp2(cs *connState, cseq string, s *ap2SetupReq
 
 	// AP2 has no Transport header; synthesize the negotiated UDP unicast
 	// transport from the stream type.
-	tr := stream.Transport{Protocol: "RTP/AVP/UDP", Mode: "unicast"}
+	tr := stream.Transport{Protocol: protocol, Mode: "unicast"}
 	if err := h.sess.Stream().Setup(tr, dataPort); err != nil {
 		return cs.writeRTSPResponse(cseq, 455, "Method Not Valid in This State", nil, nil)
 	}
+	h.streamType = stype
 
 	listenCtrl := h.listenControl
 	if listenCtrl == nil {
@@ -312,12 +380,123 @@ func (h *mediaHandler) setupStreamAp2(cs *connState, cseq string, s *ap2SetupReq
 	// h.sess) to avoid racing with close() and teardown.
 	go h.serveControl(cconn, h.sess.Stream().Format().Rate)
 
-	body, err := buildAp2StreamResponse(stype, uint16(dataPort), controlPort, 0)
+	body, err := buildAp2StreamResponse(stype, uint16(dataPort), controlPort, bufferSize)
 	if err != nil {
 		return cs.writeRTSPResponse(cseq, 500, "Internal Server Error", nil, nil)
 	}
+	if h.recordRequested {
+		if err := h.startMedia(); err != nil {
+			return cs.writeError(455, "Method Not Valid in This State")
+		}
+	}
 	return cs.writeRTSPResponse(cseq, 200, "OK",
 		map[string]string{"Content-Type": "application/x-apple-binary-plist"}, body)
+}
+
+// Native AP2 carries the codec and key in SETUP, without an SDP ANNOUNCE.
+func (h *mediaHandler) openNativeStream(entry *plist.Value) error {
+	integer := func(name string, fallback int) int {
+		if v, ok := entry.Dict[name]; ok && v.Kind == plist.KindInt {
+			return int(v.Int)
+		}
+		return fallback
+	}
+	ct, rate, channels, frames := integer("ct", 2), integer("sr", 44100), integer("ch", 2), integer("spf", 352)
+	h.log.Debug("AP2 audio format", "type", integer("type", 0), "ct", ct, "rate", rate,
+		"channels", channels, "frames", frames, "audioFormat", integer("audioFormat", 0))
+	if (ct != 2 && ct != 4) || (rate != 44100 && rate != 48000) || channels != 2 || frames <= 0 || frames > 4096 {
+		return fmt.Errorf("unsupported AP2 audio format")
+	}
+	key, ok := entry.Dict["shk"]
+	if !ok || key.Kind != plist.KindData {
+		return fmt.Errorf("AP2 stream missing encryption key")
+	}
+	decryptor, err := hap.NewAudioDecryptor(key.Data)
+	if err != nil {
+		return err
+	}
+	if h.cfg.Output == nil {
+		return fmt.Errorf("no PCM output configured")
+	}
+	m := &sdp.Media{PayloadType: 96, Encoding: "AppleLossless", ClockRate: rate, Channels: channels,
+		ALAC: &sdp.ALACConfig{FrameLength: frames, BitDepth: 16, PB: 40, MB: 10, KB: 14, Channels: channels, SampleRate: rate}}
+	if ct == 4 {
+		// AAC-LC, stereo, 1024 samples per access unit. Native AP2 sends
+		// raw access units without RFC 3640 AU headers.
+		index := 4 // 44.1 kHz
+		if rate == 48000 {
+			index = 3
+		}
+		asc := uint16(2<<11 | index<<7 | channels<<3)
+		m.Encoding, m.ALAC = "AAC", nil
+		m.AAC = &sdp.AACConfig{ASC: []byte{byte(asc >> 8), byte(asc)}}
+	}
+	format, err := stream.MediaFormat(m)
+	if err != nil {
+		return err
+	}
+	sink, err := h.cfg.Output.Open(h.ctx, format)
+	if err != nil {
+		return err
+	}
+	h.gain = pcm.NewGain(sink, h.volume)
+	var out pcm.Sink = h.gain
+	if h.clock != nil {
+		h.playout = playout.NewSynced(h.gain, h.clock.FrameLocalTime, ptp.MonotonicNanos)
+		out = h.playout
+	}
+	sess, err := media.NewSession("ap2", m, out)
+	if err == nil {
+		err = sess.Stream().Announce(m)
+	}
+	if err != nil {
+		sink.Close()
+		return err
+	}
+	sess.SetPacketDecoder(decryptor.Open)
+	if integer("type", 0) == ap2StreamBuffered {
+		var previousFormat uint32
+		var first bool
+		var firstFrame uint32
+		var frames, lastReport uint64
+		sess.SetPacketDecoder(func(packet []byte) ([]byte, error) {
+			plain, err := decryptor.OpenBuffered(packet)
+			if err != nil {
+				return nil, err
+			}
+			format := binary.BigEndian.Uint32(plain[8:12])
+			if !first || format != previousFormat {
+				h.log.Debug("AP2 buffered packet format", "format", format, "payloadBytes", len(plain)-12)
+				first, previousFormat = true, format
+			}
+			if format != 0 {
+				frame := binary.BigEndian.Uint32(plain[4:8])
+				if frames == 0 {
+					firstFrame = frame
+				}
+				frames++
+				now := ptp.MonotonicNanos()
+				if now-lastReport > 5_000_000_000 {
+					lastReport = now
+					position := sink.Position()
+					var lead int64
+					if h.clock != nil {
+						if due, ok := h.clock.FrameLocalTime(frame); ok {
+							lead = (int64(due) - int64(now)) / 1_000_000
+						}
+					}
+					h.log.Debug("AP2 audio progress", "packets", frames, "rtpSpan", uint32(frame-firstFrame),
+						"playedFrames", position.Frames, "queueMs", position.Latency.Milliseconds(), "underruns", position.Underruns, "leadMs", lead)
+				}
+			}
+			return plain, nil
+		})
+	}
+	h.sink, h.sess = h.gain, sess
+	if h.clock != nil {
+		h.clock.ClearAnchor()
+	}
+	return nil
 }
 
 // ap2TimingSyncCode is the AP2 control-port packet type (code 215) the sender
@@ -424,34 +603,85 @@ func localIP(c net.Conn) string {
 func (h *mediaHandler) record(cs *connState, req *ctlRequest) error {
 	cseq := reqHeader(req, "CSeq")
 	if h.sess == nil {
+		// Native AP2 senders can RECORD after timing SETUP and add the
+		// stream in a later SETUP. Start ingest when that stream arrives.
+		if h.eventLn != nil {
+			h.recordRequested = true
+			return cs.writeRTSPResponse(cseq, 200, "OK", map[string]string{"Audio-Latency": "0"}, nil)
+		}
 		return cs.writeRTSPResponse(cseq, 455, "Method Not Valid in This State", nil, nil)
+	}
+	if err := h.startMedia(); err != nil {
+		return cs.writeRTSPResponse(cseq, 455, "Method Not Valid in This State", nil, nil)
+	}
+	h.recordRequested = true
+	return cs.writeRTSPResponse(cseq, 200, "OK", map[string]string{"Audio-Latency": "0"}, nil)
+}
+
+func (h *mediaHandler) startMedia() error {
+	if h.mediaStarted {
+		return nil
 	}
 	if err := h.sess.Stream().Record(); err != nil {
-		return cs.writeRTSPResponse(cseq, 455, "Method Not Valid in This State", nil, nil)
+		return err
 	}
+	h.mediaStarted = true
 	sess := h.sess
+	ctx, cancel := context.WithCancel(h.ctx)
+	h.mediaCancel = cancel
 	go func() {
-		if err := sess.Serve(h.ctx); err != nil {
+		if err := sess.Serve(ctx); err != nil {
 			h.log.Debug("media serve ended", "err", err)
 		}
 	}()
-	return cs.writeRTSPResponse(cseq, 200, "OK", nil, nil)
+	return nil
 }
 
 func (h *mediaHandler) teardown(cs *connState, req *ctlRequest) error {
 	cseq := reqHeader(req, "CSeq")
-	if h.sess != nil {
-		_ = h.sess.Stream().Teardown()
+	if v, err := plist.Decode(req.body, plist.DefaultLimits()); err == nil && v.Kind == plist.KindDict {
+		if streams, ok := v.Dict["streams"]; ok && streams.Kind == plist.KindArray && len(streams.Array) > 0 {
+			h.log.Debug("AP2 audio stream teardown")
+			h.closeAudio()
+			return cs.writeRTSPResponse(cseq, 200, "OK", nil, nil)
+		}
 	}
 	h.close()
-	h.sess = nil
-	h.sink = nil
+	cs.media = nil
 	return cs.writeRTSPResponse(cseq, 200, "OK", nil, nil)
 }
 
 func (h *mediaHandler) flush(cs *connState, req *ctlRequest) error {
 	cseq := reqHeader(req, "CSeq")
-	if h.sink != nil {
+	if req.method == "FLUSHBUFFERED" && h.sess != nil {
+		v, err := plist.Decode(req.body, plist.DefaultLimits())
+		if err != nil || v.Kind != plist.KindDict {
+			return cs.writeRTSPResponse(cseq, 400, "Bad Request", nil, nil)
+		}
+		until, ok := plistInt(v, "flushUntilTS")
+		if !ok {
+			return cs.writeRTSPResponse(cseq, 400, "Bad Request", nil, nil)
+		}
+		var from *uint32
+		if value, ok := plistInt(v, "flushFromTS"); ok {
+			f := uint32(value)
+			from = &f
+		}
+		if seq, ok := plistInt(v, "flushUntilSeq"); ok {
+			var fromSeq *uint32
+			if value, ok := plistInt(v, "flushFromSeq"); ok {
+				f := uint32(value)
+				fromSeq = &f
+			}
+			h.sess.Stream().FlushBufferedRange(uint32(seq), fromSeq)
+			h.log.Debug("AP2 flush", "until", uint32(until), "untilSeq", uint32(seq)&0x7fffff, "deferred", fromSeq != nil)
+		} else {
+			h.sess.Stream().FlushRange(uint32(until), from)
+		}
+	}
+	if h.playout != nil {
+		_ = h.playout.Flush(h.ctx)
+	} else if h.sink != nil {
 		_ = h.sink.Flush(h.ctx)
 	}
 	return cs.writeRTSPResponse(cseq, 200, "OK", nil, nil)
@@ -472,6 +702,15 @@ func (h *mediaHandler) setRateAnchor(cs *connState, req *ctlRequest) error {
 		h.log.Debug("SETRATEANCHORI plist invalid", "err", err)
 		return cs.writeRTSPResponse(cseq, 400, "Bad Request", nil, nil)
 	}
+	// Pausing carries just rate=0, without a network timestamp. Treating
+	// missing anchor fields as malformed makes Apple TV disconnect on seeks.
+	if rate, ok := plistInt(v, "rate"); ok && rate == 0 {
+		if h.playout != nil {
+			_ = h.playout.SetPaused(h.ctx, true)
+		}
+		h.log.Debug("AP2 playback paused")
+		return cs.writeRTSPResponse(cseq, 200, "OK", nil, nil)
+	}
 
 	rtpTime, ok := plistInt(v, "rtpTime")
 	if !ok {
@@ -491,8 +730,15 @@ func (h *mediaHandler) setRateAnchor(cs *connState, req *ctlRequest) error {
 		MasterNs: ptp.NetworkTimeNanoseconds(uint64(secs), uint64(frac)),
 		Rate:     h.sess.Stream().Format().Rate,
 	}
+	if timeline, ok := plistInt(v, "networkTimeTimelineID"); ok {
+		binary.BigEndian.PutUint64(anchor.ClockID[:], uint64(timeline))
+	}
 	if h.clock != nil {
 		h.clock.SetAnchor(anchor)
+		h.log.Debug("AP2 playback anchor", "frame", anchor.Frame, "masterNs", anchor.MasterNs, "synced", h.clock.Status().Synced)
+	}
+	if h.playout != nil {
+		_ = h.playout.SetPaused(h.ctx, false)
 	}
 
 	return cs.writeRTSPResponse(cseq, 200, "OK", nil, nil)

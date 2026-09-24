@@ -1,0 +1,26 @@
+[Unit]
+Description=gap2 AirPlay audio receiver
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=gap2
+Group=gap2
+SupplementaryGroups=audio
+StateDirectory=gap2
+StateDirectoryMode=0700
+UMask=0077
+EnvironmentFile=/etc/gap2/receiver.env
+ExecStart=/usr/local/bin/airplay2-receiver run -name gap2 -listen :7000 -pairings /var/lib/gap2/pairings.json -audio-device ${GAP2_AUDIO_DEVICE} -interface ${GAP2_INTERFACE}
+Restart=on-failure
+RestartSec=3
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

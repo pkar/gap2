@@ -16,6 +16,8 @@ type Position struct {
 	// Timed reports whether the position is backed by a real-time clock.
 	// Untimed sinks may still report frames written.
 	Timed bool
+	// Underruns counts playback buffer underruns recovered by the sink.
+	Underruns uint64
 }
 
 // Sink consumes interleaved PCM blocks in order.

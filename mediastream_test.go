@@ -293,6 +293,94 @@ func TestMediaHandlerAp2Setup(t *testing.T) {
 }
 
 // TestMediaHandlerAp2SetupRejectsNTP returns 400 for a non-PTP timing setup.
+func TestNativeAP2RecordBeforeStreamSetup(t *testing.T) {
+	for _, tc := range []struct {
+		name                      string
+		streamType, codec, frames int64
+		network                   string
+	}{
+		{"realtime", 96, 2, 352, "udp4"}, {"buffered", 103, 4, 1024, "tcp4"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			factory := &mediaFactory{sink: &mediaRecordingSink{}}
+			s := newTestMediaServer(t, factory)
+			var wire bytes.Buffer
+			cs := &connState{log: s.log, w: &wire}
+			h := newMediaHandler(s.cfg, s.log, s.clock)
+			cs.media = h
+			defer h.close()
+			h.eventLn = &fakeListener{addr: &net.TCPAddr{Port: 5000}}
+			if err := h.record(cs, mediaRequest("RECORD", "rtsp://host/1", "1", nil, "")); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(wire.String(), "200 OK") || !h.recordRequested {
+				t.Fatal("rejected early AP2 RECORD")
+			}
+			h.bind = func(network, _ string) (int, error) {
+				if network != tc.network {
+					t.Fatalf("bound %s, want %s", network, tc.network)
+				}
+				return 7000, nil
+			}
+			h.listenControl = func() (net.PacketConn, error) { return &fakePacketConn{addr: &net.UDPAddr{Port: 7001}}, nil }
+			body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
+				"streams": plist.Array(plist.Dict(map[string]*plist.Value{
+					"type": plist.Int(tc.streamType), "ct": plist.Int(tc.codec), "sr": plist.Int(44100), "spf": plist.Int(tc.frames), "shk": plist.Data(make([]byte, 32)),
+				})),
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire.Reset()
+			if err := h.setup(cs, mediaRequest("SETUP", "rtsp://host/1", "2", nil, string(body))); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(wire.String(), "200 OK") || !h.mediaStarted {
+				t.Fatal("native stream did not start after SETUP")
+			}
+			if factory.sink.format.Rate != 44100 || factory.sink.format.Channels != 2 {
+				t.Fatalf("wrong format: %+v", factory.sink.format)
+			}
+			teardown, err := plist.Encode(plist.Dict(map[string]*plist.Value{
+				"streams": plist.Array(plist.Dict(map[string]*plist.Value{"type": plist.Int(tc.streamType)})),
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.teardown(cs, mediaRequest("TEARDOWN", "rtsp://host/1", "3", nil, string(teardown))); err != nil {
+				t.Fatal(err)
+			}
+			if h.ctx.Err() != nil || h.eventLn == nil || cs.media != h || h.sess != nil {
+				t.Fatal("stream teardown closed the enclosing AirPlay session")
+			}
+			factory.sink = &mediaRecordingSink{}
+			wire.Reset()
+			if err := h.setup(cs, mediaRequest("SETUP", "rtsp://host/1", "4", nil, string(body))); err != nil {
+				t.Fatal(err)
+			}
+			if !h.mediaStarted || !strings.Contains(wire.String(), "200 OK") {
+				t.Fatal("replacement stream failed:", wire.String())
+			}
+		})
+	}
+}
+
+func TestMediaVolumeQuery(t *testing.T) {
+	s := newTestMediaServer(t, nil)
+	var wire bytes.Buffer
+	cs := &connState{log: s.log, w: &wire}
+	if err := s.handleMedia(cs, mediaRequest("SET_PARAMETER", "*", "1", nil, "volume: -15.5\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	wire.Reset()
+	if err := s.handleMedia(cs, mediaRequest("GET_PARAMETER", "*", "2", nil, "volume\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(wire.String(), "volume: -15.500000\r\n") {
+		t.Fatal("volume query did not return the set value")
+	}
+}
+
 func TestMediaHandlerAp2SetupRejectsNTP(t *testing.T) {
 	factory := &mediaFactory{sink: &mediaRecordingSink{}}
 	s := newTestMediaServer(t, factory)
@@ -318,7 +406,7 @@ func TestMediaSetRateAnchor(t *testing.T) {
 	factory := &mediaFactory{sink: &mediaRecordingSink{}}
 	s := newTestMediaServer(t, factory)
 	buf := &bytes.Buffer{}
-	cs := &connState{log: s.log, w: buf}
+	cs := &connState{log: s.log, w: buf, sessionKey: make([]byte, 32)}
 
 	if err := s.handleMedia(cs, mediaRequest("ANNOUNCE", "rtsp://host/1", "1", nil, mediaAACBody)); err != nil {
 		t.Fatal(err)
@@ -326,14 +414,15 @@ func TestMediaSetRateAnchor(t *testing.T) {
 	buf.Reset()
 
 	body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
-		"rtpTime":         plist.Int(88200),
-		"networkTimeSecs": plist.Int(1000),
-		"networkTimeFrac": plist.Int(1 << 62), // 0.25s
+		"rtpTime":               plist.Int(88200),
+		"networkTimeSecs":       plist.Int(1000),
+		"networkTimeFrac":       plist.Int(1 << 62), // 0.25s
+		"networkTimeTimelineID": plist.Int(0x12345678),
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.handleMedia(cs, mediaRequest("SETRATEANCHORI", "rtsp://host/1", "2", nil, string(body))); err != nil {
+	if err := s.handleRequest(cs, mediaRequest("SETRATEANCHORTIME", "rtsp://host/1", "2", nil, string(body))); err != nil {
 		t.Fatal(err)
 	}
 	if got := buf.String(); !strings.Contains(got, "RTSP/1.0 200 OK") {
@@ -350,9 +439,23 @@ func TestMediaSetRateAnchor(t *testing.T) {
 	if a.Rate != 44100 {
 		t.Fatalf("anchor rate = %d, want 44100", a.Rate)
 	}
+	if binary.BigEndian.Uint64(a.ClockID[:]) != 0x12345678 {
+		t.Fatal("anchor clock identity lost")
+	}
 	// networkTimeSecs=1000, networkTimeFrac=1<<62 (0.25s) -> 1000.25s in ns.
 	if want := uint64(1000_250_000_000); a.MasterNs != want {
 		t.Fatalf("anchor master ns = %d, want %d", a.MasterNs, want)
+	}
+	buf.Reset()
+	body, err = plist.Encode(plist.Dict(map[string]*plist.Value{"rate": plist.Int(0)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.handleRequest(cs, mediaRequest("SETRATEANCHORTIME", "rtsp://host/1", "3", nil, string(body))); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "200 OK") {
+		t.Fatal("rate-only pause rejected:", buf.String())
 	}
 }
 

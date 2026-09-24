@@ -16,7 +16,7 @@ func NewDecoder(m *sdp.Media) (Decoder, error) {
 		return nil, fmt.Errorf("stream: %w: nil media", ErrUnsupported)
 	}
 	switch m.Encoding {
-	case "mpeg4-generic":
+	case "mpeg4-generic", "AAC":
 		if m.AAC == nil {
 			return nil, fmt.Errorf("stream: %w: mpeg4-generic without fmtp", ErrUnsupported)
 		}

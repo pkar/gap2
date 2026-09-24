@@ -3,6 +3,7 @@ package airplay2
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -27,6 +28,9 @@ func (h *mediaHandler) serveEvent(ln net.Listener, sessionKey []byte, legacy boo
 		return
 	}
 	defer conn.Close()
+	stop := context.AfterFunc(h.ctx, func() { _ = conn.Close() })
+	defer stop()
+	h.log.Debug("event channel connected", "remote", conn.RemoteAddr())
 
 	if legacy {
 		// The main control socket stays plaintext for binary pairing, but
@@ -118,6 +122,9 @@ func (h *mediaHandler) readEventCommands(ec *hap.Conn) {
 			return
 		}
 		typ, cmd, err := decodeEventCommand(req.body)
+		if len(req.body) == 0 {
+			continue // An acknowledgement to the receiver's updateInfo.
+		}
 		if err != nil {
 			h.log.Debug("event command decode failed", "err", err, "bytes", len(req.body))
 			continue

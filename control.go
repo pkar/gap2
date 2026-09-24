@@ -40,9 +40,13 @@ func newControlServer(cfg Config, id hap.Identity, store *pairingStore, clock *p
 // serve accepts connections until ln is closed or ctx is cancelled, then waits
 // for in-flight handlers.
 func (s *controlServer) serve(ctx context.Context, ln net.Listener) error {
+	ctx, cancel := context.WithCancel(ctx)
 	sem := make(chan struct{}, s.cfg.Limits.MaxConnections)
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	defer cancel() // close active connections before waiting for handlers
+	stopListener := context.AfterFunc(ctx, func() { _ = ln.Close() })
+	defer stopListener()
 
 	for {
 		conn, err := ln.Accept()
@@ -65,6 +69,8 @@ func (s *controlServer) serve(ctx context.Context, ln net.Listener) error {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
+			stopConn := context.AfterFunc(ctx, func() { _ = conn.Close() })
+			defer stopConn()
 			s.handleConn(conn)
 		}()
 	}
@@ -72,6 +78,7 @@ func (s *controlServer) serve(ctx context.Context, ln net.Listener) error {
 
 func (s *controlServer) handleConn(conn net.Conn) {
 	defer conn.Close()
+	s.log.Debug("control connected", "remote", conn.RemoteAddr())
 	cs := &connState{
 		conn:   conn,
 		br:     bufio.NewReader(conn),
@@ -80,6 +87,7 @@ func (s *controlServer) handleConn(conn net.Conn) {
 		limits: s.cfg.Limits,
 	}
 	defer func() {
+		s.log.Debug("control disconnected", "remote", conn.RemoteAddr(), "encrypted", cs.encrypted != nil)
 		if cs.media != nil {
 			cs.media.close()
 		}
@@ -104,7 +112,8 @@ func (s *controlServer) handleConn(conn net.Conn) {
 		if len(path) > 128 {
 			path = path[:128]
 		}
-		s.log.Debug("control request", "method", req.method, "path", path)
+		s.log.Debug("control request", "remote", conn.RemoteAddr(), "method", req.method, "path", path,
+			"protocol", req.version, "cseq", reqHeader(req, "CSeq") != "", "bodyLength", len(req.body))
 
 		if err := s.handleRequest(cs, req); err != nil {
 			s.log.Debug("control request failed", "remote", conn.RemoteAddr(), "err", err)
@@ -137,13 +146,48 @@ func (s *controlServer) handleRequest(cs *connState, req *ctlRequest) error {
 		}
 	case "POST":
 		switch req.target {
+		case "/command":
+			typ, command, err := decodeEventCommand(req.body)
+			if err != nil {
+				return cs.writeError(400, "Bad Request")
+			}
+			switch typ {
+			case commandUpdateMRSupportedCommands, commandUpdateMRNowPlayingInfo, commandUpdateMRPlaybackState:
+				// Senders also send capability notifications on a separate
+				// plaintext connection. Acknowledge them without changing an
+				// authenticated media session's metadata.
+				if cs.media != nil && cs.encrypted != nil {
+					cs.media.handleEventCommand(typ, command)
+				}
+				return cs.writeResponse(200, "OK", "application/x-apple-binary-plist", nil)
+			default:
+				return cs.writeError(501, "Not Implemented")
+			}
+		case "/feedback":
+			if cs.encrypted == nil {
+				return cs.writeError(401, "Unauthorized")
+			}
+			if h := cs.media; h != nil && h.sess != nil && h.mediaStarted {
+				body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
+					"streams": plist.Array(plist.Dict(map[string]*plist.Value{
+						"type": plist.Int(h.streamType), "sr": plist.Real(float64(h.sess.Stream().Format().Rate)),
+					})),
+				}))
+				if err != nil {
+					return err
+				}
+				return cs.writeResponse(200, "OK", "application/x-apple-binary-plist", body)
+			}
+			return cs.writeResponse(200, "OK", "text/plain", nil)
+		case "/fp-setup":
+			return s.handleFPSetup(cs, req)
 		case "/pair-setup":
 			return s.handlePairSetup(cs, req)
 		case "/pair-verify":
 			return s.handlePairVerify(cs, req)
 		}
 	case "ANNOUNCE", "SETUP", "RECORD", "TEARDOWN", "FLUSH", "FLUSHBUFFERED",
-		"GET_PARAMETER", "SET_PARAMETER", "SETRATEANCHORI", "SETRATEANCHORTI", "SETPEERS", "SETPEERSX":
+		"GET_PARAMETER", "SET_PARAMETER", "SETRATEANCHORI", "SETRATEANCHORTI", "SETRATEANCHORTIME", "SETPEERS", "SETPEERSX", "LOUDNESSNORMALIZATION":
 		if len(cs.sessionKey) == 0 {
 			return cs.writeResponse(401, "Unauthorized", "text/plain", nil)
 		}
@@ -164,30 +208,39 @@ func (s *controlServer) infoPlist() ([]byte, error) {
 	return plist.Encode(s.infoValue())
 }
 
-// Advertise the implemented audio and pairing paths, not the old Apple TV
-// video/cloud/TLS flags. In particular PTP (bit 41) must be present for the
-// realtime AP2 stream; buffered audio (bit 40) is NOT implemented. FairPlay
-// SAP (bits 12/14) must remain off until /fp-setup and media-key decryption
-// are both supported. Some Apple Music senders require FairPlay and therefore
-// cannot stream with this capability set.
+// PTP, audio authentication and the AP2 routing bit are required for Apple TV
+// to negotiate a native stream. Bit 40 selects this path even for realtime
+// type 96; type 103 uses the buffered TCP transport.
+// FPSAP v2.5 (bit 12), video, cloud and TLS capabilities remain disabled.
 const airplayFeatures uint64 = (1 << 9) | // AirPlay audio
+	(1 << 14) | // FPLY v3 setup followed by native AP2 stream encryption
 	(1 << 15) | (1 << 16) | (1 << 17) | // artwork, progress, DAAP metadata
 	(1 << 18) | (1 << 19) | (1 << 20) | // PCM, ALAC, AAC-LC
 	(1 << 22) | // unencrypted audio
 	(1 << 27) | // legacy pairing
 	(1 << 30) | // unified advertising /info
+	(1 << 38) | // CoreUtils pairing and encrypted control
+	(1 << 40) | // AirPlay 2 audio routing
 	(1 << 41) | // PTP timing
-	(1 << 46) | (1 << 48) // HomeKit and transient pairing
+	(1 << 46) | (1 << 47) | (1 << 48) // HomeKit, PTP peer management, transient pairing
 
 // infoValue builds the receiver info dictionary shared by the discovery
 // /info endpoint and the AP2 event-channel updateInfo push.
 func (s *controlServer) infoValue() *plist.Value {
 	mac := s.store.deviceID()
+	// Senders request the DNS-SD TXT data through /info as well as mDNS.
+	// Each string uses the same one-byte length prefix as a DNS TXT record.
+	var txt []byte
+	for _, entry := range airplayTXT(mac, s.identity) {
+		txt = append(txt, byte(len(entry)))
+		txt = append(txt, entry...)
+	}
 	return plist.Dict(map[string]*plist.Value{
+		"txtAirPlay":      plist.Data(txt),
 		"deviceID":        plist.String(mac),
 		"features":        plist.Int(int64(airplayFeatures)),
 		"statusFlags":     plist.Int(0x4),
-		"model":           plist.String("AppleTV6,2"),
+		"model":           plist.String("gap2"),
 		"name":            plist.String(s.cfg.Name),
 		"pi":              plist.String(string(s.identity.ID)),
 		"psi":             plist.String(string(s.identity.ID)),
@@ -302,6 +355,7 @@ type connState struct {
 	verify       *hap.PairVerifySession
 	legacySetup  bool
 	legacyVerify *hap.LegacyVerify
+	fpStarted    bool
 	encrypted    *hap.Conn
 	media        *mediaHandler
 
@@ -324,7 +378,8 @@ func (cs *connState) upgrade(sessionKey []byte) error {
 }
 
 func (cs *connState) writeTLV(body []byte) error {
-	return cs.writeResponse(200, "OK", "application/pairing+tlv8", body)
+	// AirPlay carries HAP TLV8 pairing messages in an octet-stream envelope.
+	return cs.writeResponse(200, "OK", "application/octet-stream", body)
 }
 
 func (cs *connState) writeResponse(status int, reason, contentType string, body []byte) error {
@@ -356,6 +411,9 @@ func (cs *connState) writeRTSPResponse(cseq string, status int, reason string, h
 	}
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "RTSP/1.0 %d %s\r\n", status, reason)
+	if _, ok := headers["Server"]; !ok {
+		b.WriteString("Server: AirTunes/366.0\r\n")
+	}
 	if cseq != "" {
 		fmt.Fprintf(&b, "CSeq: %s\r\n", cseq)
 	}

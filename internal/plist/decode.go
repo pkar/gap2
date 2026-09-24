@@ -300,9 +300,9 @@ func (d *binaryDecoder) readInt(pos uint64, info byte) (int64, error) {
 		return 0, err
 	}
 	u := readUint(d.data, pos, size)
-	// Sign-extend from size*8 bits to 64 bits.
-	shift := uint(64 - size*8)
-	return int64(u<<shift) >> shift, nil
+	// Binary plists use unsigned compact integers. Negative integers are
+	// always encoded in eight bytes; only that width has a sign bit.
+	return int64(u), nil
 }
 
 func (d *binaryDecoder) readLength(pos uint64, info byte) (uint64, uint64, error) {

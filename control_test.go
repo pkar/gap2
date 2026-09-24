@@ -144,17 +144,38 @@ func TestControlInfo(t *testing.T) {
 	if features.Kind != plist.KindInt || features.Int != int64(airplayFeatures) {
 		t.Fatalf("/info features = %v, want 0x%X", features, airplayFeatures)
 	}
+	// Decode the DNS TXT wire format as a sender does, independently of the
+	// /info builder, and require it to agree with the mDNS advertisement.
+	txtValue, ok := v.Dict["txtAirPlay"]
+	if !ok || txtValue.Kind != plist.KindData {
+		t.Fatal("/info missing binary txtAirPlay")
+	}
+	var entries []string
+	for data := txtValue.Data; len(data) > 0; {
+		n := int(data[0])
+		if n+1 > len(data) {
+			t.Fatal("truncated /info TXT record")
+		}
+		entries = append(entries, string(data[1:n+1]))
+		data = data[n+1:]
+	}
+	if !slices.Equal(entries, airplayTXT(s.store.deviceID(), s.identity)) {
+		t.Fatal("/info TXT differs from discovery")
+	}
+	if !slices.Contains(entries, "model="+v.Dict["model"].String) {
+		t.Fatal("/info model differs from discovery")
+	}
 }
 
 func TestAirPlayFeaturesMatchImplementedAudio(t *testing.T) {
 	const unsupported = (1 << 0) | (1 << 2) | (1 << 7) | // video/mirroring
-		(1 << 12) | (1 << 14) | // FairPlay SAP
-		(1 << 40) | // buffered audio: only realtime is implemented
+		(1 << 12) | // FPSAP v2.5
 		(1 << 35) // TLS-PSK
 	if airplayFeatures&unsupported != 0 {
 		t.Fatalf("unsupported capabilities advertised: 0x%X", airplayFeatures&unsupported)
 	}
-	const required = (1 << 9) | (1 << 19) | (1 << 20) | (1 << 27) | (1 << 41) | (1 << 46)
+	const required = (1 << 9) | (1 << 14) | (1 << 19) | (1 << 20) | (1 << 27) |
+		(1 << 38) | (1 << 40) | (1 << 41) | (1 << 46) | (1 << 47) | (1 << 48)
 	if airplayFeatures&required != required {
 		t.Fatalf("missing audio, pairing or PTP capabilities: 0x%X", required&^airplayFeatures)
 	}
@@ -269,6 +290,9 @@ func TestControlPairSetupM1(t *testing.T) {
 	raw := "POST /pair-setup HTTP/1.1\r\nContent-Type: application/pairing+tlv8\r\nContent-Length: " + strconv.Itoa(len(m1)) + "\r\n\r\n" + string(m1)
 	resp := exchange(t, conn, raw)
 
+	if ct := resp.headers["content-type"]; len(ct) != 1 || ct[0] != "application/octet-stream" {
+		t.Fatalf("AirPlay pairing content-type = %v", ct)
+	}
 	if statusCode(resp.status) != "200" {
 		t.Fatalf("status = %q, want 200 (body %x)", resp.status, resp.body)
 	}

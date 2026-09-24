@@ -224,7 +224,10 @@ func (d *Decoder) Decode(au []byte) (pcm.Block, error) {
 // writeBlock converts float samples at integer-PCM scale into interleaved
 // little-endian 16-bit PCM.
 func writeBlock(block pcm.Block, out []float64) (pcm.Block, error) {
-	for i, v := range out {
+	for i := range out {
+		// The filterbank writes planar channels; PCM sinks require frames
+		// interleaved as L,R,L,R rather than a whole L block then R.
+		v := out[(i%block.Format.Channels)*1024+i/block.Format.Channels]
 		s := floatToInt16(v)
 		block.Data[2*i] = byte(s)
 		block.Data[2*i+1] = byte(s >> 8)

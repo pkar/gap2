@@ -5,15 +5,21 @@ module and a standalone command that wraps the same API.
 
 ## Status
 
-**In progress.** The receiver library is importable and the standalone command
-runs. Implemented and tested: discovery (mDNS/DNS-SD), HAP pairing and the
-encrypted control transport, RTSP/SDP/RTP media transport with the AirPlay 2
-plist-based SETUP flow, ALAC and AAC-LC decoding, a realtime PCM playout
-scheduler, PTP synchronization, and PTP-anchored playback driven by the AP2
-control channel, plus AP2 event-channel playback-state and now-playing metadata
-(including cover art). End-to-end playback from real AirPlay 2 senders has not
-yet been validated on hardware; protocol details that require a live sender are
-reported as such rather than simulated.
+**In progress.** Supports encrypted buffered audio and stream replacement
+without reconnecting the enclosing AirPlay session.
+The receiver supports transient HAP pairing, encrypted control and event
+channels, native AP2 setup, realtime UDP and buffered TCP audio, ALAC and
+AAC-LC decoding, and PTP playback anchors. AAC decoding is checked against an
+independently encoded tone and reference PCM. Buffered stream replacement
+preserves the control/event session, and flushes use the transport sequence
+counter to handle channel changes that reset audio timestamps.
+
+Linux amd64 and arm64 can play directly through an ALSA hardware device,
+without cgo, libasound, or subprocesses. Other platforms can use a PCM file or
+an application-provided sink. Hardware playback requires the device to accept
+the negotiated sample rate; resampling, multichannel audio, and seamless
+midstream codec changes are not implemented. Lip-sync accuracy and the wider
+sender/device matrix still require validation.
 
 ## Layout
 
@@ -21,11 +27,12 @@ reported as such rather than simulated.
 .                       public package airplay2 (lifecycle, config, events, PCM contracts)
 pcm/                    PCM formats, blocks, and sink contracts
 output/pcmfile/         deterministic raw-PCM sink for tests and capture
+output/alsa/            native Linux ALSA playback sink
 internal/plist/         bounded Apple property-list parsing and serialization
 internal/rtsp/          bounded RTSP-like message parser
 internal/sdp/           bounded SDP parser for ANNOUNCE bodies
 internal/rtp/           bounded RTP packet parser
-internal/media/         RTP media transport (UDP binding and dispatch)
+internal/media/         realtime UDP and length-framed buffered TCP transport
 internal/stream/        per-stream ANNOUNCE/SETUP/RECORD state machine and RTP ingest
 internal/aac/           ADTS framing and AAC-LC spectral decoding
 internal/alac/          Apple Lossless (ALAC) decoder
@@ -66,6 +73,24 @@ The production contract is cgo-free; the suite also runs under `go test -race`
 in a cgo-enabled environment when available. The `version` subcommand reports
 the build version, which release builds set via
 `-ldflags "-X main.version=<version>"`.
+
+## Playback
+
+Set the pairing-state path and audio device for your own host, then run:
+
+```sh
+airplay2-receiver run -name "gap2" \
+  -pairings "$GAP2_PAIRINGS_PATH" -audio-device "$GAP2_AUDIO_DEVICE"
+```
+
+Use `-output audio.pcm` instead of `-audio-device` to capture raw interleaved
+S16LE PCM. Apple TV's volume setting is applied to either output. Access to
+the ALSA device and PTP ports 319/320 is required. The sample
+[`deploy/gap2.service`](deploy/gap2.service) runs as a dedicated `gap2` user
+with membership in `audio` and permission to bind those ports. Adjust its
+interface and device in the external `/etc/gap2/receiver.env` file before
+installing it. Host-specific configuration and validation records belong
+outside this repository.
 
 ## License
 

@@ -2,6 +2,8 @@ package playout
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkar/gap2/pcm"
@@ -21,9 +23,12 @@ const sleepChunk = 10 * time.Millisecond
 // clock offset are established) is written immediately, so audio still flows
 // even while synchronization is being acquired.
 type Synced struct {
-	sink     pcm.Sink
-	mapFrame func(frame uint32) (uint64, bool)
-	now      func() uint64
+	mu         sync.Mutex
+	paused     atomic.Bool
+	generation atomic.Uint64
+	sink       pcm.Sink
+	mapFrame   func(frame uint32) (uint64, bool)
+	now        func() uint64
 }
 
 // NewSynced returns a Synced that schedules writes onto sink. A nil mapFrame
@@ -48,10 +53,48 @@ func NewSynced(sink pcm.Sink, mapFrame func(frame uint32) (uint64, bool), now fu
 // deadline mapped from frame. It blocks until the deadline passes (or ctx is
 // cancelled) before handing the block to the sink.
 func (s *Synced) WriteTimed(ctx context.Context, frame uint32, block pcm.Block) error {
-	if deadline, ok := s.mapFrame(frame); ok {
-		if err := s.waitUntil(ctx, deadline); err != nil {
-			return err
+	generation := s.generation.Load()
+	for {
+		if s.paused.Load() || generation != s.generation.Load() {
+			return nil
 		}
+		deadline, ok := s.mapFrame(frame)
+		if !ok {
+			break
+		}
+		// A hardware sink must receive samples before their presentation
+		// deadline so the DMA queue can absorb scheduler and network jitter.
+		// File sinks have no playback clock and retain exact capture timing.
+		if s.sink.Position().Timed {
+			const lead = uint64(100 * time.Millisecond)
+			if deadline > lead {
+				deadline -= lead
+			} else {
+				deadline = 0
+			}
+		}
+		remain := int64(deadline) - int64(s.now())
+		if remain <= 0 {
+			break
+		}
+		delay := time.Duration(remain)
+		if delay > sleepChunk {
+			delay = sleepChunk
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		// Seek/reconnect can replace the anchor while this packet waits.
+		// Recompute its deadline instead of sleeping against a stale epoch.
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.paused.Load() || generation != s.generation.Load() {
+		return nil
 	}
 	return s.sink.Write(ctx, block)
 }
@@ -63,32 +106,24 @@ func (s *Synced) Write(ctx context.Context, block pcm.Block) error {
 }
 
 // Flush forwards to the underlying sink.
-func (s *Synced) Flush(ctx context.Context) error { return s.sink.Flush(ctx) }
+func (s *Synced) Flush(ctx context.Context) error {
+	s.generation.Add(1)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sink.Flush(ctx)
+}
+
+// SetPaused discards queued and waiting output without closing the stream.
+func (s *Synced) SetPaused(ctx context.Context, paused bool) error {
+	s.paused.Store(paused)
+	if paused {
+		return s.Flush(ctx)
+	}
+	return nil
+}
 
 // Position forwards to the underlying sink.
 func (s *Synced) Position() pcm.Position { return s.sink.Position() }
 
 // Close forwards to the underlying sink.
 func (s *Synced) Close() error { return s.sink.Close() }
-
-// waitUntil blocks until the monotonic clock reaches until, sleeping in
-// bounded chunks so ctx cancellation is honored within sleepChunk.
-func (s *Synced) waitUntil(ctx context.Context, until uint64) error {
-	for {
-		remain := int64(until) - int64(s.now())
-		if remain <= 0 {
-			return nil
-		}
-		d := time.Duration(remain)
-		if d > sleepChunk {
-			d = sleepChunk
-		}
-		timer := time.NewTimer(d)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-}

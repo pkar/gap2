@@ -15,7 +15,7 @@ type Anchor struct {
 	// carried by code-215 timing-sync packets and lets the receiver detect a
 	// grandmaster change: an anchor for a different clock than the one the
 	// receiver is synchronized to must not be trusted. It is zero for anchors
-	// set by SETRATEANCHORI, which carries no clock identity.
+	// from networkTimeTimelineID in SETRATEANCHORTIME requests as well.
 	ClockID [8]byte
 }
 

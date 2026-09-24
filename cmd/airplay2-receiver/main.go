@@ -16,6 +16,7 @@ import (
 	"syscall"
 
 	airplay2 "github.com/pkar/gap2"
+	"github.com/pkar/gap2/output/alsa"
 	"github.com/pkar/gap2/output/pcmfile"
 	"github.com/pkar/gap2/pcm"
 )
@@ -73,6 +74,7 @@ func run(args []string) {
 	pin := fs.String("pin", "3939", "numeric pairing setup code")
 	pairings := fs.String("pairings", "", "JSON file for persistent pairings (empty = in-memory)")
 	output := fs.String("output", "", "write decoded PCM to this file (\"-\" for stdout)")
+	device := fs.String("audio-device", "", "Linux ALSA playback device path")
 	debug := fs.Bool("debug", false, "enable debug logging")
 	var ifaces stringSlice
 	fs.Var(&ifaces, "interface", "network interface (repeatable)")
@@ -83,6 +85,13 @@ func run(args []string) {
 	_ = fs.Parse(args)
 
 	var out pcm.Factory
+	if *device != "" && *output != "" {
+		fmt.Fprintln(os.Stderr, "airplay2-receiver: choose either -audio-device or -output")
+		os.Exit(2)
+	}
+	if *device != "" {
+		out = alsa.Device(*device)
+	}
 	if *output != "" {
 		var w io.Writer
 		var f *os.File

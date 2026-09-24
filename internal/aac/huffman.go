@@ -112,27 +112,25 @@ func decodeSpectral(r *BitReader, cb int, out []int) error {
 		}
 		return nil
 	}
-	// Codebook 11's escape word comes before its sign bit: the base value 16
-	// is replaced by the escaped magnitude, and only then is the sign read.
-	if cb == 11 {
-		for d := 0; d < dim; d++ {
-			if out[d] == 16 {
-				out[d], err = decodeEscape(r)
-				if err != nil {
-					return err
-				}
+	// All nonzero sign bits precede codebook 11's escape magnitudes.
+	var negative [4]bool
+	for d := 0; d < dim; d++ {
+		if out[d] != 0 {
+			negative[d], err = r.ReadBit()
+			if err != nil {
+				return err
 			}
 		}
 	}
 	for d := 0; d < dim; d++ {
-		if out[d] != 0 {
-			neg, err := r.ReadBit()
+		if cb == 11 && out[d] == 16 {
+			out[d], err = decodeEscape(r)
 			if err != nil {
 				return err
 			}
-			if neg {
-				out[d] = -out[d]
-			}
+		}
+		if negative[d] {
+			out[d] = -out[d]
 		}
 	}
 	return nil

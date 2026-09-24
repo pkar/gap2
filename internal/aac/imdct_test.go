@@ -33,6 +33,27 @@ func TestIMDCTShape(t *testing.T) {
 	}
 }
 
+func TestFFTMatchesDirectIMDCT(t *testing.T) {
+	for _, n := range []int{128, 1024} {
+		src, got := make([]float64, n), make([]float64, 2*n)
+		for k := range src {
+			src[k] = math.Sin(float64(k)*0.37) * 100
+		}
+		if err := IMDCT(got, src); err != nil {
+			t.Fatal(err)
+		}
+		for _, i := range []int{0, 1, n / 2, n - 1, n, 2*n - 1} {
+			var want float64
+			for k, x := range src {
+				want += x * math.Cos(math.Pi/float64(n)*(float64(i)+float64(n+1)/2)*(float64(k)+0.5)) / float64(n)
+			}
+			if math.Abs(got[i]-want) > 1e-9 {
+				t.Fatalf("n=%d sample=%d: got %g want %g", n, i, got[i], want)
+			}
+		}
+	}
+}
+
 func TestIMDCTPerfectReconstruction(t *testing.T) {
 	for _, n := range []int{4, 8, 16, 64, 256} {
 		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {

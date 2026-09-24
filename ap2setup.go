@@ -33,6 +33,7 @@ type ap2SetupRequest struct {
 	groupUUID                string
 	groupContainsGroupLeader bool
 	streamTypes              []int64 // requested stream types, in order
+	streams                  []*plist.Value
 }
 
 // parseAp2Setup decodes body as an AirPlay 2 SETUP plist. It returns
@@ -54,6 +55,7 @@ func parseAp2Setup(body []byte) (*ap2SetupRequest, error) {
 				}
 				if t, ok := it.Dict["type"]; ok && t.Kind == plist.KindInt {
 					req.streamTypes = append(req.streamTypes, t.Int)
+					req.streams = append(req.streams, it)
 				}
 			}
 		}

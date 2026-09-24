@@ -27,9 +27,8 @@ type Clock struct {
 	// valid reports whether offsetNs holds an estimate.
 	valid bool
 
-	// raw is the most recent un-smoothed offset sample, used for the
-	// exponential filter.
-	raw int64
+	syncs    map[syncKey]syncSample
+	sourceID [8]byte
 	// samples counts Follow_Up messages since the master was selected.
 	samples uint64
 
@@ -39,6 +38,18 @@ type Clock struct {
 	anchor    Anchor
 	anchorSet bool
 }
+
+type syncKey struct {
+	clock          [8]byte
+	port, sequence uint16
+	domain         uint8
+}
+type syncSample struct {
+	local      uint64
+	correction int64
+}
+
+func keyFor(h Header) syncKey { return syncKey{h.ClockID, h.SourcePort, h.Sequence, h.Domain} }
 
 // Info is a snapshot of the clock's current state.
 type Info struct {
@@ -90,8 +101,9 @@ func (c *Clock) HandleAnnounce(m Message) {
 	}
 	changed := c.masterID != [8]byte{}
 	c.masterID = m.Grandmaster
+	c.sourceID = m.Header.ClockID
+	c.syncs = nil
 	c.offsetNs = 0
-	c.raw = 0
 	c.valid = false
 	c.samples = 0
 	if changed {
@@ -99,10 +111,19 @@ func (c *Clock) HandleAnnounce(m Message) {
 	}
 }
 
-// HandleSync records receipt of a Sync message. The offset is not updated
-// until the matching Follow_Up arrives, so this is a no-op beyond keeping the
-// clock warm; it exists for symmetry with the protocol flow.
-func (c *Clock) HandleSync(m Message, localNs uint64) {}
+// HandleSync retains the event packet's receive time for its Follow_Up.
+// Follow_Up network transit time must not become clock error.
+func (c *Clock) HandleSync(m Message, localNs uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sourceID != [8]byte{} && m.Header.ClockID != c.sourceID {
+		return
+	}
+	if c.syncs == nil || len(c.syncs) >= 8 {
+		c.syncs = make(map[syncKey]syncSample)
+	}
+	c.syncs[keyFor(m.Header)] = syncSample{localNs, m.Header.CorrectionNs}
+}
 
 // HandleFollowUp updates the offset estimate using the preciseOriginTimestamp
 // of a Follow_Up message received at local monotonic time localNs.
@@ -116,25 +137,28 @@ func (c *Clock) HandleSync(m Message, localNs uint64) {}
 func (c *Clock) HandleFollowUp(m Message, localNs uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.sourceID != [8]byte{} && m.Header.ClockID != c.sourceID {
+		return
+	}
+	correction := m.Header.CorrectionNs
+	if sample, ok := c.syncs[keyFor(m.Header)]; ok {
+		localNs = sample.local
+		correction += sample.correction
+		delete(c.syncs, keyFor(m.Header))
+	}
 
-	raw := int64(m.Precise.AsNanos()) + m.Header.CorrectionNs - int64(localNs)
+	raw := int64(m.Precise.AsNanos()) + correction - int64(localNs)
 	c.localNs = localNs
 	c.samples++
 
 	if !c.valid {
-		c.raw = raw
 		c.offsetNs = raw
 		c.valid = true
 		return
 	}
-	// Exponential smoothing: new = old + (raw-old)/8. Large positive jumps are
-	// more likely to be network delay, so they are damped more heavily.
-	delta := raw - c.raw
-	if delta > 0 {
-		delta /= 8
-	}
-	c.raw = raw
-	c.offsetNs += delta / 8
+	// Average against the estimate, not the previous raw sample. Integrating
+	// asymmetrically weighted sample differences makes ordinary jitter drift.
+	c.offsetNs += (raw - c.offsetNs) / 8
 }
 
 // Info returns a snapshot of the clock state.
@@ -190,6 +214,13 @@ func (c *Clock) SetAnchor(a Anchor) {
 	}
 	c.anchor = a
 	c.anchorSet = true
+}
+
+// ClearAnchor starts a new RTP timestamp epoch while retaining PTP sync.
+func (c *Clock) ClearAnchor() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.anchorSet = false
 }
 
 // Anchor returns the most recent playback anchor and whether one is set.

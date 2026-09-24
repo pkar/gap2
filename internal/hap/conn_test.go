@@ -154,10 +154,10 @@ func TestKeyDerivation(t *testing.T) {
 	}
 
 	ev := NewEventConn(discardConn{}, shared)
-	if want := hkdfSHA512(shared, []byte("Events-Salt"), []byte("Events-Read-Encryption-Key"), 32); !bytes.Equal(ev.outKey, want) {
+	if want := hkdfSHA512(shared, []byte("Events-Salt"), []byte("Events-Write-Encryption-Key"), 32); !bytes.Equal(ev.outKey, want) {
 		t.Errorf("event outKey: got %x want %x", ev.outKey, want)
 	}
-	if want := hkdfSHA512(shared, []byte("Events-Salt"), []byte("Events-Write-Encryption-Key"), 32); !bytes.Equal(ev.inKey, want) {
+	if want := hkdfSHA512(shared, []byte("Events-Salt"), []byte("Events-Read-Encryption-Key"), 32); !bytes.Equal(ev.inKey, want) {
 		t.Errorf("event inKey: got %x want %x", ev.inKey, want)
 	}
 	if bytes.Equal(ev.outKey, ev.inKey) {

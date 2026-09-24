@@ -44,7 +44,7 @@ func Encode(v *Value) ([]byte, error) {
 	for _, obj := range e.objects {
 		bodyLen += len(obj)
 	}
-	offsetIntSize := bytesFor(bodyLen)
+	offsetIntSize := bytesFor(len(header) + bodyLen - 1)
 
 	buf := make([]byte, 0, len(header)+bodyLen+objCount*offsetIntSize+32)
 	buf = append(buf, header...)
@@ -228,25 +228,13 @@ func (e *binEncoder) add(v *Value, depth int) (int, error) {
 }
 
 func encodeInt(v int64) []byte {
-	switch {
-	case v >= -128 && v <= 127:
-		return []byte{0x10, byte(v)}
-	case v >= -32768 && v <= 32767:
-		b := make([]byte, 3)
-		b[0] = 0x11
-		binary.BigEndian.PutUint16(b[1:], uint16(v))
-		return b
-	case v >= -2147483648 && v <= 2147483647:
-		b := make([]byte, 5)
-		b[0] = 0x12
-		binary.BigEndian.PutUint32(b[1:], uint32(v))
-		return b
-	default:
-		b := make([]byte, 9)
-		b[0] = 0x13
-		binary.BigEndian.PutUint64(b[1:], uint64(v))
-		return b
+	if v >= 0 {
+		return encodeUintAsInt(uint64(v))
 	}
+	b := make([]byte, 9)
+	b[0] = 0x13
+	binary.BigEndian.PutUint64(b[1:], uint64(v))
+	return b
 }
 
 func encodeBlob(marker byte, data []byte) []byte {

@@ -77,15 +77,21 @@ func (s State) String() string {
 
 // Stream owns the state and pipeline for one media stream.
 type Stream struct {
-	mu        sync.Mutex
-	id        string
-	state     State
-	media     *sdp.Media
-	format    pcm.Format
-	transport Transport
-	server    int
-	decoder   Decoder
-	sink      pcm.Sink
+	mu              sync.Mutex
+	id              string
+	state           State
+	media           *sdp.Media
+	format          pcm.Format
+	transport       Transport
+	server          int
+	decoder         Decoder
+	sink            pcm.Sink
+	resetDecoder    bool
+	flushActive     bool
+	flushUntil      uint32
+	flushFrom       uint32
+	hasFlushFrom    bool
+	flushBySequence bool
 }
 
 // New returns a stream that will decode with decoder and write decoded blocks
@@ -127,7 +133,7 @@ func MediaFormat(m *sdp.Media) (pcm.Format, error) {
 	}
 	rate, channels := 0, 0
 	switch m.Encoding {
-	case "mpeg4-generic":
+	case "mpeg4-generic", "AAC":
 		rate, channels = m.ClockRate, m.Channels
 	case "AppleLossless":
 		if m.ALAC == nil {
@@ -202,9 +208,45 @@ func (s *Stream) Teardown() error {
 	return nil
 }
 
+// FlushRange removes old encoded packets from a seek or channel change.
+// Timestamp comparisons use signed deltas to handle RTP wraparound.
+func (s *Stream) FlushRange(until uint32, from *uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.flushUntil, s.flushActive, s.resetDecoder = until, true, from == nil
+	s.flushBySequence = false
+	s.hasFlushFrom = from != nil
+	if from != nil {
+		s.flushFrom = *from
+	}
+}
+
+// FlushBufferedRange uses the buffered transport's 23-bit sequence counter.
+// RTP timestamps can change epochs at the endpoint, so cannot identify which
+// queued packets belong to the old channel.
+func (s *Stream) FlushBufferedRange(until uint32, from *uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.flushUntil, s.flushActive, s.resetDecoder = until&0x7fffff, true, from == nil
+	s.flushBySequence = true
+	s.hasFlushFrom = from != nil
+	if from != nil {
+		s.flushFrom = *from & 0x7fffff
+	}
+}
+
+// IngestBufferedRTP retains the sequence bits lost when normalizing to RTP.
+func (s *Stream) IngestBufferedRTP(ctx context.Context, pkt []byte, sequence uint32) error {
+	return s.ingestRTP(ctx, pkt, sequence)
+}
+
 // IngestRTP handles one RTP packet: it verifies the payload type, extracts
 // AAC access units, decodes them, and writes the resulting PCM to the sink.
 func (s *Stream) IngestRTP(ctx context.Context, pkt []byte) error {
+	return s.ingestRTP(ctx, pkt, 0)
+}
+
+func (s *Stream) ingestRTP(ctx context.Context, pkt []byte, sequence uint32) error {
 	s.mu.Lock()
 	state := s.state
 	media := s.media
@@ -220,6 +262,31 @@ func (s *Stream) IngestRTP(ctx context.Context, pkt []byte) error {
 	p, err := rtp.Parse(pkt)
 	if err != nil {
 		return err
+	}
+	s.mu.Lock()
+	if s.flushActive {
+		position := p.Timestamp
+		delta := func(a, b uint32) int32 { return int32(a - b) }
+		if s.flushBySequence {
+			position = sequence
+			delta = func(a, b uint32) int32 { return int32((a-b)<<9) >> 9 }
+		}
+		if delta(position, s.flushUntil) >= 0 {
+			s.flushActive = false
+			s.resetDecoder = true
+		} else if !s.hasFlushFrom || delta(position, s.flushFrom) >= 0 {
+			s.resetDecoder = true
+			s.mu.Unlock()
+			return nil
+		}
+	}
+	reset := s.resetDecoder
+	s.resetDecoder = false
+	s.mu.Unlock()
+	if reset {
+		if d, ok := s.decoder.(interface{ Reset() }); ok {
+			d.Reset()
+		}
 	}
 	if pt != 0 && int(p.PayloadType) != pt {
 		return fmt.Errorf("stream: payload type %d, want %d", p.PayloadType, pt)
@@ -245,8 +312,8 @@ func (s *Stream) IngestRTP(ctx context.Context, pkt []byte) error {
 			}
 		}
 		return nil
-	case "AppleLossless":
-		// AirPlay packs exactly one ALAC frame per RTP packet.
+	case "AppleLossless", "AAC":
+		// Native AirPlay packs exactly one raw access unit per packet.
 		block, err := s.decoder.Decode(p.Payload)
 		if err != nil {
 			return err

@@ -120,6 +120,73 @@ func TestStreamAACIngest(t *testing.T) {
 	}
 }
 
+func TestBufferedFlushDropsOldFramesAcrossWrap(t *testing.T) {
+	sink := &timedSink{}
+	s := New("1", stubDecoder{block: pcm.Block{}}, sink)
+	m := aacMedia()
+	m.Encoding = "AAC"
+	if err := s.Announce(m); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Setup(Transport{Protocol: "RTP/AVP/TCP"}, 7000); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Record(); err != nil {
+		t.Fatal(err)
+	}
+	s.FlushRange(1024, nil)
+	for _, ts := range []uint32{^uint32(0) - 1023, 0, 1024} {
+		if err := s.IngestRTP(context.Background(), rtpPacketTS([]byte{0}, ts)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(sink.frames) != 1 || sink.frames[0] != 1024 {
+		t.Fatalf("flush played timestamps %v", sink.frames)
+	}
+}
+
+func TestBufferedFlushSequenceSurvivesTimestampEpochChange(t *testing.T) {
+	for _, deferred := range []bool{false, true} {
+		sink := &timedSink{}
+		s := New("1", stubDecoder{block: pcm.Block{}}, sink)
+		m := aacMedia()
+		m.Encoding = "AAC"
+		if err := s.Announce(m); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Setup(Transport{Protocol: "RTP/AVP/TCP"}, 7000); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Record(); err != nil {
+			t.Fatal(err)
+		}
+		var from *uint32
+		if deferred {
+			f := uint32(0x7fffff)
+			from = &f
+		}
+		s.FlushBufferedRange(1, from)
+		// The endpoint starts a new timestamp epoch behind the old one,
+		// while sequence counters wrap independently at 23 bits.
+		for i, seq := range []uint32{0x7ffffe, 0x7fffff, 0, 1, 2} {
+			ts := uint32(3504865437)
+			if i >= 3 {
+				ts = uint32(3348046257 + (i-3)*1024)
+			}
+			if err := s.IngestBufferedRTP(context.Background(), rtpPacketTS([]byte{0}, ts), seq); err != nil {
+				t.Fatal(err)
+			}
+		}
+		want := 2
+		if deferred {
+			want++
+		}
+		if len(sink.frames) != want || sink.frames[want-2] != 3348046257 {
+			t.Fatalf("deferred=%v played timestamps %v", deferred, sink.frames)
+		}
+	}
+}
+
 func TestStreamTimedSink(t *testing.T) {
 	decoded := pcm.Block{Format: pcm.Format{Rate: 44100, Channels: 2, Format: pcm.S16LE}, Data: []byte{0, 1, 2, 3}}
 	sink := &timedSink{}

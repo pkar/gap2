@@ -12,8 +12,8 @@ import (
 // convention: "read"/"write" are from the controller's perspective, so the
 // accessory decrypts incoming data with the write key and encrypts outgoing
 // data with the read key. The event connection runs in the other direction
-// (accessory to controller), but its separate salt uses the same directional
-// labels. Both channels derive their keys from the same shared secret with
+// (accessory to controller), so its directional labels are reversed.
+// Both channels derive their keys from the same shared secret with
 // SHA-512 HKDF.
 const (
 	controlSalt      = "Control-Salt"
@@ -73,9 +73,9 @@ func NewLegacyConn(c net.Conn, sharedKey []byte) *Conn {
 // NewEventConn wraps c as an accessory-side encrypted AirPlay 2 event channel.
 // It derives its keys from the same shared secret as the control channel but
 // with the event-specific salt and info labels. The accessory sends events
-// with the read key and receives responses with the write key.
+// with the write key and receives responses with the read key.
 func NewEventConn(c net.Conn, sharedKey []byte) *Conn {
-	return newConn(c, sharedKey, eventSalt, eventReadInfo, eventWriteInfo)
+	return newConn(c, sharedKey, eventSalt, eventWriteInfo, eventReadInfo)
 }
 
 // newConn derives the two directional ChaCha20-Poly1305 keys from sharedKey
