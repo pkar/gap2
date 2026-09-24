@@ -4,12 +4,13 @@ import (
 	"fmt"
 
 	"github.com/pkar/gap2/internal/aac"
+	"github.com/pkar/gap2/internal/alac"
 	"github.com/pkar/gap2/internal/sdp"
 )
 
 // NewDecoder returns the codec decoder for an announced media description.
 // For mpeg4-generic streams it parses the fmtp config= AudioSpecificConfig and
-// returns an AAC-LC decoder; ALAC is not yet implemented.
+// returns an AAC-LC decoder; AppleLossless streams get an ALAC decoder.
 func NewDecoder(m *sdp.Media) (Decoder, error) {
 	if m == nil {
 		return nil, fmt.Errorf("stream: %w: nil media", ErrUnsupported)
@@ -25,7 +26,7 @@ func NewDecoder(m *sdp.Media) (Decoder, error) {
 		}
 		return aac.NewDecoder(asc)
 	case "AppleLossless":
-		return nil, fmt.Errorf("stream: %w: AppleLossless decoder not implemented", ErrUnsupported)
+		return alac.NewDecoder(m.ALAC)
 	default:
 		return nil, fmt.Errorf("stream: %w: %s", ErrUnsupported, m.Encoding)
 	}
