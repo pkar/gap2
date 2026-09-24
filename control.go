@@ -75,6 +75,11 @@ func (s *controlServer) handleConn(conn net.Conn) {
 		log:    s.log,
 		limits: s.cfg.Limits,
 	}
+	defer func() {
+		if cs.media != nil {
+			cs.media.close()
+		}
+	}()
 
 	for {
 		if cs.limits.ReadHeaderTimeout > 0 {
@@ -111,6 +116,12 @@ func (s *controlServer) handleRequest(cs *connState, req *ctlRequest) error {
 		case "/pair-verify":
 			return s.handlePairVerify(cs, req)
 		}
+	case "ANNOUNCE", "SETUP", "RECORD", "TEARDOWN", "FLUSH", "FLUSHBUFFERED",
+		"GET_PARAMETER", "SET_PARAMETER", "SETRATEANCHORTIME", "SETPEERS", "SETPEERSX":
+		if cs.encrypted == nil {
+			return cs.writeResponse(401, "Unauthorized", "text/plain", nil)
+		}
+		return s.handleMedia(cs, req)
 	}
 	return cs.writeResponse(501, "Not Implemented", "text/plain", nil)
 }
@@ -193,6 +204,7 @@ type connState struct {
 	setup     *hap.PairSetupSession
 	verify    *hap.PairVerifySession
 	encrypted *hap.Conn
+	media     *mediaHandler
 }
 
 func (cs *connState) upgrade(sessionKey []byte) error {
@@ -217,6 +229,21 @@ func (cs *connState) writeResponse(status int, reason, contentType string, body 
 	if contentType != "" {
 		fmt.Fprintf(&b, "Content-Type: %s\r\n", contentType)
 	}
+	b.WriteString("\r\n")
+	b.Write(body)
+	return writeAll(cs.w, b.Bytes())
+}
+
+// writeRTSPResponse writes an RTSP/1.0 response over the encrypted control
+// channel, echoing the request's CSeq.
+func (cs *connState) writeRTSPResponse(cseq string, status int, reason string, headers map[string]string, body []byte) error {
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "RTSP/1.0 %d %s\r\n", status, reason)
+	fmt.Fprintf(&b, "CSeq: %s\r\n", cseq)
+	for k, v := range headers {
+		fmt.Fprintf(&b, "%s: %s\r\n", k, v)
+	}
+	fmt.Fprintf(&b, "Content-Length: %d\r\n", len(body))
 	b.WriteString("\r\n")
 	b.Write(body)
 	return writeAll(cs.w, b.Bytes())
