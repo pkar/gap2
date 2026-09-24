@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 
 	"github.com/pkar/gap2/internal/media"
@@ -30,6 +31,18 @@ type mediaHandler struct {
 
 	// bind is overridable in tests to avoid binding a real socket.
 	bind func(network, addr string) (int, error)
+
+	// listenEvent and listenControl are overridable in tests (the sandbox
+	// forbids socket binds). They open the AP2 event TCP listener and control
+	// UDP socket respectively.
+	listenEvent   func() (net.Listener, error)
+	listenControl func() (net.PacketConn, error)
+
+	// eventLn is the TCP listener handed back to the sender as the AP2 event
+	// port; controlConn is the UDP socket for the AP2 control port. Both stay
+	// open for the life of the session so the advertised ports remain valid.
+	eventLn     net.Listener
+	controlConn net.PacketConn
 }
 
 func newMediaHandler(cfg Config, log *slog.Logger, clock *ptp.Clock) *mediaHandler {
@@ -49,6 +62,14 @@ func (h *mediaHandler) close() {
 	}
 	if h.sink != nil {
 		_ = h.sink.Close()
+	}
+	if h.eventLn != nil {
+		_ = h.eventLn.Close()
+		h.eventLn = nil
+	}
+	if h.controlConn != nil {
+		_ = h.controlConn.Close()
+		h.controlConn = nil
 	}
 }
 
@@ -123,6 +144,16 @@ func (h *mediaHandler) announce(cs *connState, req *ctlRequest) error {
 
 func (h *mediaHandler) setup(cs *connState, req *ctlRequest) error {
 	cseq := reqHeader(req, "CSeq")
+
+	// AirPlay 2 carries SETUP parameters in a binary plist body; AirPlay 1
+	// uses a Transport header with an empty body. Prefer the plist form when
+	// the body decodes as one.
+	if len(req.body) > 0 {
+		if s, err := parseAp2Setup(req.body); err == nil {
+			return h.setupAp2(cs, cseq, s)
+		}
+	}
+
 	if h.sess == nil {
 		return cs.writeRTSPResponse(cseq, 455, "Method Not Valid in This State", nil, nil)
 	}
@@ -149,6 +180,119 @@ func (h *mediaHandler) setup(cs *connState, req *ctlRequest) error {
 		"Session":   h.sess.Stream().ID(),
 	}
 	return cs.writeRTSPResponse(cseq, 200, "OK", headers, nil)
+}
+
+// setupAp2 dispatches a parsed AirPlay 2 SETUP body to the timing or media
+// exchange.
+func (h *mediaHandler) setupAp2(cs *connState, cseq string, s *ap2SetupRequest) error {
+	switch s.kind {
+	case setupInitial:
+		return h.setupInitialAp2(cs, cseq, s)
+	case setupStream:
+		return h.setupStreamAp2(cs, cseq, s)
+	default:
+		return cs.writeRTSPResponse(cseq, 400, "Bad Request", nil, nil)
+	}
+}
+
+// setupInitialAp2 answers the initial AP2 SETUP: it accepts PTP timing and
+// returns the event port, a timingPort of 0, and the receiver's timing peer
+// info.
+func (h *mediaHandler) setupInitialAp2(cs *connState, cseq string, s *ap2SetupRequest) error {
+	if s.timingProtocol != "PTP" {
+		h.log.Debug("AP2 SETUP timing protocol unsupported", "timingProtocol", s.timingProtocol)
+		return cs.writeRTSPResponse(cseq, 400, "Bad Request", nil, nil)
+	}
+
+	listen := h.listenEvent
+	if listen == nil {
+		listen = func() (net.Listener, error) { return net.Listen("tcp4", ":0") }
+	}
+	ln, err := listen()
+	if err != nil {
+		h.log.Debug("AP2 event listen failed", "err", err)
+		return cs.writeRTSPResponse(cseq, 500, "Internal Server Error", nil, nil)
+	}
+	port := uint16(ln.Addr().(*net.TCPAddr).Port)
+	h.eventLn = ln
+
+	body, err := buildAp2InitialResponse(port, localIP(cs.conn))
+	if err != nil {
+		return cs.writeRTSPResponse(cseq, 500, "Internal Server Error", nil, nil)
+	}
+	return cs.writeRTSPResponse(cseq, 200, "OK",
+		map[string]string{"Content-Type": "application/x-apple-binary-plist"}, body)
+}
+
+// setupStreamAp2 answers the media SETUP: it selects a supported stream type
+// (realtime UDP audio), binds the RTP data and AP2 control ports, and returns
+// them in the streams array.
+func (h *mediaHandler) setupStreamAp2(cs *connState, cseq string, s *ap2SetupRequest) error {
+	if h.sess == nil {
+		return cs.writeRTSPResponse(cseq, 455, "Method Not Valid in This State", nil, nil)
+	}
+
+	var stype int64 = -1
+	for _, t := range s.streamTypes {
+		if t == ap2StreamRealtime {
+			stype = t
+			break
+		}
+	}
+	if stype < 0 {
+		return cs.writeRTSPResponse(cseq, 415, "Unsupported Media Type", nil, nil)
+	}
+
+	bind := h.bind
+	if bind == nil {
+		bind = h.sess.Bind
+	}
+	dataPort, err := bind("udp4", ":0")
+	if err != nil {
+		h.log.Debug("media bind failed", "err", err)
+		return cs.writeRTSPResponse(cseq, 500, "Internal Server Error", nil, nil)
+	}
+
+	// AP2 has no Transport header; synthesize the negotiated UDP unicast
+	// transport from the stream type.
+	tr := stream.Transport{Protocol: "RTP/AVP/UDP", Mode: "unicast"}
+	if err := h.sess.Stream().Setup(tr, dataPort); err != nil {
+		return cs.writeRTSPResponse(cseq, 455, "Method Not Valid in This State", nil, nil)
+	}
+
+	listenCtrl := h.listenControl
+	if listenCtrl == nil {
+		listenCtrl = func() (net.PacketConn, error) {
+			return net.ListenUDP("udp4", &net.UDPAddr{Port: 0})
+		}
+	}
+	cconn, err := listenCtrl()
+	if err != nil {
+		h.log.Debug("AP2 control bind failed", "err", err)
+		return cs.writeRTSPResponse(cseq, 500, "Internal Server Error", nil, nil)
+	}
+	h.controlConn = cconn
+	controlPort := uint16(cconn.LocalAddr().(*net.UDPAddr).Port)
+
+	body, err := buildAp2StreamResponse(stype, uint16(dataPort), controlPort, 0)
+	if err != nil {
+		return cs.writeRTSPResponse(cseq, 500, "Internal Server Error", nil, nil)
+	}
+	return cs.writeRTSPResponse(cseq, 200, "OK",
+		map[string]string{"Content-Type": "application/x-apple-binary-plist"}, body)
+}
+
+// localIP returns the local IP of a connection as a string, used to populate
+// the receiver's timingPeerInfo.
+func localIP(c net.Conn) string {
+	if c == nil || c.LocalAddr() == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(c.LocalAddr().String())
+	if err != nil {
+		return c.LocalAddr().String()
+	}
+	return host
 }
 
 func (h *mediaHandler) record(cs *connState, req *ctlRequest) error {

@@ -3,8 +3,11 @@ package airplay2
 import (
 	"bytes"
 	"context"
+	"net"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pkar/gap2/internal/plist"
 	"github.com/pkar/gap2/pcm"
@@ -164,7 +167,118 @@ func TestMediaAnnounceNoOutput(t *testing.T) {
 	}
 }
 
-// TestMediaSetRateAnchor drives ANNOUNCE then SETRATEANCHORI and verifies the
+// fakeTCPAddr and fakeListener stand in for a bound TCP listener in tests.
+type fakeTCPAddr struct{ port int }
+
+func (fakeTCPAddr) Network() string  { return "tcp" }
+func (a fakeTCPAddr) String() string { return "127.0.0.1:" + itoa(a.port) }
+
+func itoa(n int) string { return strconv.Itoa(n) }
+
+type fakeListener struct{ addr net.Addr }
+
+func (l *fakeListener) Accept() (net.Conn, error) { return nil, net.ErrClosed }
+func (l *fakeListener) Close() error              { return nil }
+func (l *fakeListener) Addr() net.Addr            { return l.addr }
+
+// fakeUDPAddr and fakePacketConn stand in for a bound UDP socket in tests.
+type fakeUDPAddr struct{ port int }
+
+func (fakeUDPAddr) Network() string  { return "udp" }
+func (a fakeUDPAddr) String() string { return "127.0.0.1:" + itoa(a.port) }
+
+type fakePacketConn struct{ addr net.Addr }
+
+func (c *fakePacketConn) ReadFrom(b []byte) (int, net.Addr, error)  { return 0, nil, net.ErrClosed }
+func (c *fakePacketConn) WriteTo(b []byte, a net.Addr) (int, error) { return len(b), nil }
+func (c *fakePacketConn) Close() error                              { return nil }
+func (c *fakePacketConn) LocalAddr() net.Addr                       { return c.addr }
+func (c *fakePacketConn) SetDeadline(time.Time) error               { return nil }
+func (c *fakePacketConn) SetReadDeadline(time.Time) error           { return nil }
+func (c *fakePacketConn) SetWriteDeadline(time.Time) error          { return nil }
+
+// TestMediaHandlerAp2Setup drives the AirPlay 2 plist SETUP exchanges: the
+// initial (timing) SETUP followed by the stream SETUP.
+func TestMediaHandlerAp2Setup(t *testing.T) {
+	factory := &mediaFactory{sink: &mediaRecordingSink{}}
+	s := newTestMediaServer(t, factory)
+	buf := &bytes.Buffer{}
+	cs := &connState{log: s.log, w: buf}
+	// Pre-create the media handler so we can inject the socket factories
+	// before the first SETUP (which runs before ANNOUNCE).
+	cs.media = newMediaHandler(s.cfg, s.log, s.clock)
+
+	// Initial (timing) SETUP with PTP. No ANNOUNCE has happened yet.
+	cs.media.listenEvent = func() (net.Listener, error) {
+		return &fakeListener{addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5000}}, nil
+	}
+	initBody, err := plist.Encode(plist.Dict(map[string]*plist.Value{
+		"timingProtocol": plist.String("PTP"),
+		"groupUUID":      plist.String("00000000-0000-0000-0000-000000000000"),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.handleMedia(cs, mediaRequest("SETUP", "rtsp://host/1", "1", nil, string(initBody))); err != nil {
+		t.Fatal(err)
+	}
+	got := buf.String()
+	if !strings.Contains(got, "RTSP/1.0 200 OK") {
+		t.Fatalf("initial SETUP response = %q", got)
+	}
+	if !strings.Contains(got, "Content-Type: application/x-apple-binary-plist") {
+		t.Fatalf("initial SETUP missing plist Content-Type: %q", got)
+	}
+	buf.Reset()
+
+	// ANNOUNCE the audio stream, then the stream SETUP (type 96).
+	if err := s.handleMedia(cs, mediaRequest("ANNOUNCE", "rtsp://host/1", "2", nil, mediaAACBody)); err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+
+	cs.media.bind = func(_, _ string) (int, error) { return 7000, nil }
+	cs.media.listenControl = func() (net.PacketConn, error) {
+		return &fakePacketConn{addr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7001}}, nil
+	}
+	streamBody, err := plist.Encode(plist.Dict(map[string]*plist.Value{
+		"streams": plist.Array(plist.Dict(map[string]*plist.Value{
+			"type":     plist.Int(96),
+			"dataPort": plist.Int(6000),
+		})),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.handleMedia(cs, mediaRequest("SETUP", "rtsp://host/1", "3", nil, string(streamBody))); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); !strings.Contains(got, "RTSP/1.0 200 OK") {
+		t.Fatalf("stream SETUP response = %q", got)
+	}
+}
+
+// TestMediaHandlerAp2SetupRejectsNTP returns 400 for a non-PTP timing setup.
+func TestMediaHandlerAp2SetupRejectsNTP(t *testing.T) {
+	factory := &mediaFactory{sink: &mediaRecordingSink{}}
+	s := newTestMediaServer(t, factory)
+	buf := &bytes.Buffer{}
+	cs := &connState{log: s.log, w: buf}
+
+	body, err := plist.Encode(plist.Dict(map[string]*plist.Value{
+		"timingProtocol": plist.String("NTP"),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.handleMedia(cs, mediaRequest("SETUP", "rtsp://host/1", "1", nil, string(body))); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); !strings.Contains(got, "RTSP/1.0 400") {
+		t.Fatalf("NTP SETUP response = %q, want 400", got)
+	}
+}
+
 // playback anchor is recorded against the negotiated sample rate.
 func TestMediaSetRateAnchor(t *testing.T) {
 	factory := &mediaFactory{sink: &mediaRecordingSink{}}
