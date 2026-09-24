@@ -52,6 +52,24 @@ type Info struct {
 	Valid bool
 }
 
+// Status is a compact snapshot of a Clock for reporting. It folds the offset
+// estimate and playback anchor into two booleans plus the raw offset.
+type Status struct {
+	// Synced reports whether an offset estimate is available.
+	Synced bool
+	// OffsetNs is the smoothed master-minus-local offset in nanoseconds.
+	OffsetNs int64
+	// Anchored reports whether a usable playback anchor has been recorded.
+	Anchored bool
+}
+
+// Status returns a snapshot suitable for status reporting.
+func (c *Clock) Status() Status {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return Status{Synced: c.valid, OffsetNs: c.offsetNs, Anchored: c.anchorSet}
+}
+
 // NewClock returns an empty Clock.
 func NewClock() *Clock { return &Clock{} }
 

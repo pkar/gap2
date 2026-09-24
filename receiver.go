@@ -23,6 +23,9 @@ type Status struct {
 	StartedAt     time.Time
 	SessionCount  int
 	DroppedEvents int64
+	// PTP reports the synchronized clock state. Synced and Anchored are false
+	// until PTP messages and a SETRATEANCHORI request have been received.
+	PTP ptp.Status
 }
 
 // Receiver owns a single AirPlay 2 receiver instance.
@@ -205,12 +208,16 @@ func (r *Receiver) Addr() net.Addr {
 func (r *Receiver) Status() Status {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return Status{
+	st := Status{
 		State:         r.state,
 		StartedAt:     r.startedAt,
 		SessionCount:  r.sessionCount,
 		DroppedEvents: r.droppedEvents.Load(),
 	}
+	if r.ptpClock != nil {
+		st.PTP = r.ptpClock.Status()
+	}
+	return st
 }
 
 // Close shuts the receiver down and is idempotent. It closes the listener

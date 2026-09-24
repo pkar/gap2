@@ -249,3 +249,23 @@ func TestClockAnchor(t *testing.T) {
 		t.Fatalf("FrameLocalTime(+1s) = %d, want 10999999500", lt)
 	}
 }
+
+func TestClockStatus(t *testing.T) {
+	c := NewClock()
+	if st := c.Status(); st.Synced || st.Anchored || st.OffsetNs != 0 {
+		t.Fatalf("initial Status = %+v, want zeroed", st)
+	}
+
+	c.HandleFollowUp(Message{
+		Header:  Header{MessageType: TypeFollowUp},
+		Precise: Timestamp{Seconds: 10, Nanos: 500},
+	}, 10_000_000_000)
+	if st := c.Status(); !st.Synced || st.OffsetNs != 500 {
+		t.Fatalf("Status after FollowUp = %+v, want synced offset 500", st)
+	}
+
+	c.SetAnchor(Anchor{Frame: 0, MasterNs: 10_000_000_000, Rate: 44100})
+	if st := c.Status(); !st.Anchored {
+		t.Fatalf("Status after SetAnchor = %+v, want anchored", st)
+	}
+}
