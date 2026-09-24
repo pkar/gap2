@@ -51,8 +51,33 @@ func TestDecodeTruncated(t *testing.T) {
 	}
 }
 
-func TestDecodeOrphanFragment(t *testing.T) {
-	if _, err := Decode([]byte{0x81, 0x01, 0xAA}); err == nil {
-		t.Fatal("expected orphan fragment error")
+func TestDecodeAppleSRPPublicKeyFragments(t *testing.T) {
+	// A real HAP 384-byte SRP public key is type 3, length 255, then
+	// type 3 again, length 129. The high bit is NOT a fragment marker.
+	key := bytes.Repeat([]byte{0x5a}, 384)
+	wire := append([]byte{3, 255}, key[:255]...)
+	wire = append(wire, 3, 129)
+	wire = append(wire, key[255:]...)
+	items, err := Decode(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Type != 3 || !bytes.Equal(items[0].Value, key) {
+		t.Fatal("did not reassemble same-type public key fragments")
+	}
+	encoded, err := Encode(items)
+	if err != nil || !bytes.Equal(encoded, wire) {
+		t.Fatal("did not encode same-type fragments")
+	}
+}
+
+func TestDecodeDistinctRepeatedTypeAndHighType(t *testing.T) {
+	wire := []byte{0x81, 1, 0xaa, 3, 1, 0x01, 3, 1, 0x02}
+	items, err := Decode(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 3 || items[0].Type != 0x81 || items[1].Type != 3 || items[2].Type != 3 {
+		t.Fatalf("unexpected items: %+v", items)
 	}
 }

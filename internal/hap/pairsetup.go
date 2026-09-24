@@ -1,7 +1,6 @@
 package hap
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 
@@ -82,10 +81,15 @@ func (s *PairSetupSession) handleM1(items []tlv8.Item) (PairSetupResult, error) 
 		}
 	}
 	if flags, ok := getItem(items, TLVFlags); ok {
-		if len(flags) != 4 {
+		// HAP flags are a variable-width (0..4 byte) little-endian integer.
+		// Apple senders commonly encode transient pairing in just one byte.
+		if len(flags) > 4 {
 			return PairSetupResult{}, fmt.Errorf("%w: malformed flags", ErrInvalidTLV)
 		}
-		f := binary.BigEndian.Uint32(flags)
+		var f uint32
+		for i, b := range flags {
+			f |= uint32(b) << (8 * i)
+		}
 		if f&FlagSplit != 0 {
 			return PairSetupResult{}, fmt.Errorf("%w: split pairing unsupported", ErrInvalidTLV)
 		}
@@ -139,6 +143,15 @@ func (s *PairSetupSession) handleM3(items []tlv8.Item) (PairSetupResult, error) 
 	})
 	if err != nil {
 		return PairSetupResult{}, err
+	}
+	if s.transient {
+		// Transient Pair Setup ends at M4: no accessory/controller identity
+		// exchange (M5/M6) follows. The next request uses HAP encryption.
+		return PairSetupResult{
+			Response:   resp,
+			Done:       true,
+			SessionKey: s.srp.sessionKeyBytes(),
+		}, nil
 	}
 	return PairSetupResult{Response: resp}, nil
 }

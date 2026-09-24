@@ -9,12 +9,12 @@ import (
 )
 
 // Key-derivation salts and info labels. The control channel follows the HAP
-// convention: "read"/"write" are from the accessory's perspective, so the
-// accessory encrypts outgoing data with the write key and decrypts incoming
-// data with the read key. The event channel inverts the labels relative to
-// the control channel: the accessory encrypts with the read key and decrypts
-// with the write key. Both channels derive their keys from the same shared
-// secret with SHA-512 HKDF.
+// convention: "read"/"write" are from the controller's perspective, so the
+// accessory decrypts incoming data with the write key and encrypts outgoing
+// data with the read key. The event connection runs in the other direction
+// (accessory to controller), but its separate salt uses the same directional
+// labels. Both channels derive their keys from the same shared secret with
+// SHA-512 HKDF.
 const (
 	controlSalt      = "Control-Salt"
 	controlReadInfo  = "Control-Read-Encryption-Key"
@@ -44,8 +44,9 @@ type Conn struct {
 	inKey  []byte
 	outKey []byte
 
-	inCounter  uint64
-	outCounter uint64
+	inCounter   uint64
+	outCounter  uint64
+	legacyNonce bool
 
 	readBuf []byte
 	readErr error
@@ -55,13 +56,24 @@ type Conn struct {
 // sharedKey is the Pair Verify X25519 shared secret or the transient Pair
 // Setup SRP session key.
 func NewConn(c net.Conn, sharedKey []byte) *Conn {
-	return newConn(c, sharedKey, controlSalt, controlWriteInfo, controlReadInfo)
+	return newConn(c, sharedKey, controlSalt, controlReadInfo, controlWriteInfo)
+}
+
+// NewLegacyConn wraps the binary legacy pairing control channel. Unlike HAP,
+// it uses empty-salt HKDF and a little-endian nonce starting at byte zero.
+func NewLegacyConn(c net.Conn, sharedKey []byte) *Conn {
+	return &Conn{
+		c:           c,
+		outKey:      hkdfSHA512(sharedKey, nil, []byte("ClientEncrypt-main"), 32),
+		inKey:       hkdfSHA512(sharedKey, nil, []byte("ServerEncrypt-main"), 32),
+		legacyNonce: true,
+	}
 }
 
 // NewEventConn wraps c as an accessory-side encrypted AirPlay 2 event channel.
 // It derives its keys from the same shared secret as the control channel but
-// with the event-specific salt and info labels, and with the read/write roles
-// inverted as the event-channel spec requires.
+// with the event-specific salt and info labels. The accessory sends events
+// with the read key and receives responses with the write key.
 func NewEventConn(c net.Conn, sharedKey []byte) *Conn {
 	return newConn(c, sharedKey, eventSalt, eventReadInfo, eventWriteInfo)
 }
@@ -102,7 +114,7 @@ func (c *Conn) readRecord() error {
 	if _, err := io.ReadFull(c.c, payload); err != nil {
 		return err
 	}
-	plain, err := aeadOpen(c.inKey, recordNonce(c.inCounter), payload, lenBuf[:])
+	plain, err := aeadOpen(c.inKey, c.nonce(c.inCounter), payload, lenBuf[:])
 	if err != nil {
 		return err
 	}
@@ -131,7 +143,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 func (c *Conn) writeRecord(plain []byte) error {
 	var lenBuf [2]byte
 	binary.LittleEndian.PutUint16(lenBuf[:], uint16(len(plain)))
-	sealed := aeadSeal(c.outKey, recordNonce(c.outCounter), plain, lenBuf[:])
+	sealed := aeadSeal(c.outKey, c.nonce(c.outCounter), plain, lenBuf[:])
 	c.outCounter++
 	return writeFull(c.c, append(lenBuf[:], sealed...))
 }
@@ -148,6 +160,15 @@ func writeFull(w io.Writer, b []byte) error {
 		b = b[n:]
 	}
 	return nil
+}
+
+func (c *Conn) nonce(counter uint64) []byte {
+	if c.legacyNonce {
+		n := make([]byte, 12)
+		binary.LittleEndian.PutUint64(n, counter)
+		return n
+	}
+	return recordNonce(counter)
 }
 
 // recordNonce builds the 12-byte record nonce: four zero bytes plus the

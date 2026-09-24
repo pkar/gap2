@@ -90,7 +90,21 @@ func (s *pairingStore) ensureIdentity(rand io.Reader) (hap.Identity, error) {
 	if err != nil {
 		return hap.Identity{}, fmt.Errorf("airplay2: decode identity seed: %w", err)
 	}
-	return hap.NewIdentityFromSeed(s.data.PairingID, seed)
+	return hap.NewIdentityFromSeed(airplayPairingID(s.data.PairingID), seed)
+}
+
+// airplayPairingID renders the stored 16-byte identifier as a version-4 UUID.
+// Keep the on-disk bytes (and their MAC-style device ID) unchanged across
+// upgrades; the HAP accessory identifier and advertised pi must agree.
+func airplayPairingID(stored string) string {
+	b, err := hex.DecodeString(stored)
+	if err != nil || len(b) != 16 {
+		return stored // Preserve externally supplied identifiers.
+	}
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	s := hex.EncodeToString(b)
+	return s[:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:]
 }
 
 // deviceID renders the pairing identifier as a MAC-style identifier, using the

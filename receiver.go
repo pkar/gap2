@@ -2,7 +2,7 @@ package airplay2
 
 import (
 	"context"
-	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -321,7 +321,7 @@ func startDiscovery(ctx context.Context, cfg Config, addr net.Addr, identity hap
 		{
 			Type:     "_raop._tcp",
 			Instance: hostname + "@" + cfg.Name,
-			TXT:      raopTXT(),
+			TXT:      raopTXT(identity),
 		},
 	}
 
@@ -358,36 +358,38 @@ func airplayTXT(mac string, identity hap.Identity) []string {
 	return []string{
 		"txtvers=1",
 		"deviceid=" + mac,
-		"features=0x5A7FFFF7,0x1E",
+		fmt.Sprintf("features=0x%X,0x%X", uint32(airplayFeatures&0xffffffff), airplayFeatures>>32),
 		"flags=0x4",
 		"model=AppleTV6,2",
-		"pk=" + base64.StdEncoding.EncodeToString(identity.PublicKey()),
+		"pk=" + hex.EncodeToString(identity.PublicKey()),
 		"pi=" + string(identity.ID),
+		"psi=" + string(identity.ID),
+		"protovers=1.1",
 		"srcvers=366.0",
-		"vv=2",
+		"vv=1",
 	}
 }
 
-// raopTXT builds the DNS-SD TXT record set for the legacy _raop._tcp
-// instance. It advertises AirPlay 2 capability through the "am" key so
-// clients that first discover RAOP know this target also speaks AirPlay 2.
-func raopTXT() []string {
+// raopTXT builds the matching AirPlay 2 _raop._tcp record. Its advertised
+// features, status flags, and long-term key must agree with _airplay._tcp;
+// otherwise Music can discover the receiver but reject the output route.
+func raopTXT(identity hap.Identity) []string {
 	return []string{
 		"txtvers=1",
 		"ch=2",
 		"cn=0,1,2,3",
-		"et=0,3,5",
-		"sv=false",
+		// Only unencrypted RAOP audio is implemented. Types 3 and 5 are
+		// FairPlay SAP and require /fp-setup and media-key decryption.
+		"et=0",
 		"da=true",
-		"sr=44100",
-		"ss=16",
-		"pw=false",
-		"vn=3",
 		"tp=UDP",
-		"sm=false",
-		"ek=1",
 		"md=0,1,2",
-		"am=AirPlay2",
+		"am=AppleTV6,2",
+		fmt.Sprintf("ft=0x%X,0x%X", uint32(airplayFeatures&0xffffffff), airplayFeatures>>32),
+		"sf=0x4",
+		"pk=" + hex.EncodeToString(identity.PublicKey()),
+		"vn=65537",
 		"vs=366.0",
+		"vv=1",
 	}
 }

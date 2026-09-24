@@ -3,6 +3,7 @@ package hap
 import (
 	"crypto/rand"
 	"crypto/sha512"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"math/big"
@@ -72,6 +73,12 @@ func fromHexByte(c byte) (byte, bool) {
 // big-endian bytes of each integer argument and the raw bytes of each string
 // argument. pad left-pads each integer to the group size.
 func srpHash(pad bool, args ...any) *big.Int {
+	return new(big.Int).SetBytes(srpDigest(pad, args...))
+}
+
+// srpDigest retains all 64 bytes when a hash is fed into another hash.
+// Converting an intermediate digest to a big.Int would discard leading zeros.
+func srpDigest(pad bool, args ...any) []byte {
 	h := sha512.New()
 	for _, a := range args {
 		switch v := a.(type) {
@@ -89,7 +96,7 @@ func srpHash(pad bool, args ...any) *big.Int {
 			panic(fmt.Sprintf("hap: unsupported SRP hash argument %T", a))
 		}
 	}
-	return new(big.Int).SetBytes(h.Sum(nil))
+	return h.Sum(nil)
 }
 
 // minBytes returns the minimal big-endian representation of a non-negative
@@ -124,9 +131,12 @@ type srpServer struct {
 	clientPublic *big.Int
 	u            *big.Int
 	session      *big.Int // S
-	key          *big.Int // K
+	key          *big.Int // K, for compatibility with integer SRP tests
+	keyDigest    []byte   // full 64-byte K for proofs and transport keys
 	m1           *big.Int
+	m1Digest     []byte
 	m2           *big.Int
+	m2Digest     []byte
 }
 
 // newSRPServer creates a server for username with the given password. HAP
@@ -152,7 +162,7 @@ func newSRPServer(rand io.Reader, username, password string) (*srpServer, error)
 	secret.Mod(secret, n)
 
 	// x = H(salt || H(username ":" password))
-	x := srpHash(false, salt, srpHash(false, username+":"+password))
+	x := srpHash(false, salt, srpDigest(false, username+":"+password))
 	verifier := new(big.Int).Exp(g, x, n)
 
 	// B = (k*v + g^b) mod n
@@ -199,31 +209,36 @@ func (s *srpServer) setClientPublic(aBytes []byte) error {
 	t.Exp(t, s.secret, s.n)
 	s.session = t
 
-	s.key = srpHash(false, s.session)
+	s.keyDigest = srpDigest(false, s.session)
+	s.key = new(big.Int).SetBytes(s.keyDigest)
 
-	// M1 = H(H(N) ^ H(g) || H(I) || s || A || B || K)
-	hN := srpHash(false, s.n)
-	hG := srpHash(false, s.g)
-	hN.Xor(hN, hG)
-	s.m1 = srpHash(false, hN, srpHash(false, usernamePairSetup), s.salt, a, s.public, s.key)
+	// M1 = H(H(N) ^ H(g) || H(I) || s || A || B || K).
+	// H(N), H(g), H(I), and K are byte digests, not minimal big integers.
+	hNG := srpDigest(false, s.n)
+	hG := srpDigest(false, s.g)
+	for i := range hNG {
+		hNG[i] ^= hG[i]
+	}
+	s.m1Digest = srpDigest(false, hNG, srpDigest(false, usernamePairSetup), s.salt, a, s.public, s.keyDigest)
+	s.m1 = new(big.Int).SetBytes(s.m1Digest)
 	return nil
 }
 
-// verifyProof checks the client's M1 proof and derives M2.
+// verifyProof checks the client's full 64-byte M1 proof and derives M2.
 func (s *srpServer) verifyProof(clientProof []byte) bool {
-	m1Client := new(big.Int).SetBytes(clientProof)
-	if s.m1.Cmp(m1Client) != 0 {
+	if subtle.ConstantTimeCompare(s.m1Digest, clientProof) != 1 {
 		return false
 	}
-	s.m2 = srpHash(false, s.clientPublic, s.m1, s.key)
+	s.m2Digest = srpDigest(false, s.clientPublic, s.m1Digest, s.keyDigest)
+	s.m2 = new(big.Int).SetBytes(s.m2Digest)
 	return true
 }
 
-// proofBytes returns the server M2 proof, valid after verifyProof.
-func (s *srpServer) proofBytes() []byte { return minBytes(s.m2) }
+// proofBytes returns the full 64-byte server M2 proof, valid after verifyProof.
+func (s *srpServer) proofBytes() []byte { return s.m2Digest }
 
-// sessionKeyBytes returns K as minimal big-endian bytes.
-func (s *srpServer) sessionKeyBytes() []byte { return minBytes(s.key) }
+// sessionKeyBytes returns the full 64-byte SRP session key.
+func (s *srpServer) sessionKeyBytes() []byte { return s.keyDigest }
 
 const usernamePairSetup = "Pair-Setup"
 

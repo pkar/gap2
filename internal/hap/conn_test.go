@@ -10,12 +10,12 @@ import (
 
 // newControllerConn mirrors NewConn for the controller side of the channel:
 // its outgoing key is the accessory's incoming key and vice versa. The
-// controller encrypts with the read key and decrypts with the write key.
+// controller encrypts with the write key and decrypts with the read key.
 func newControllerConn(c net.Conn, shared []byte) *Conn {
 	return &Conn{
 		c:      c,
-		outKey: hkdfSHA512(shared, []byte(controlSalt), []byte(controlReadInfo), 32),
-		inKey:  hkdfSHA512(shared, []byte(controlSalt), []byte(controlWriteInfo), 32),
+		outKey: hkdfSHA512(shared, []byte(controlSalt), []byte(controlWriteInfo), 32),
+		inKey:  hkdfSHA512(shared, []byte(controlSalt), []byte(controlReadInfo), 32),
 	}
 }
 
@@ -88,6 +88,31 @@ func TestConnRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLegacyConnKeysAndNonce(t *testing.T) {
+	shared := bytes.Repeat([]byte{0x55}, 32)
+	accessory := NewLegacyConn(discardConn{}, shared)
+	if !bytes.Equal(accessory.outKey, hkdfSHA512(shared, nil, []byte("ClientEncrypt-main"), 32)) ||
+		!bytes.Equal(accessory.inKey, hkdfSHA512(shared, nil, []byte("ServerEncrypt-main"), 32)) {
+		t.Fatal("wrong legacy key derivation or direction")
+	}
+	if got := accessory.nonce(1); !bytes.Equal(got, []byte{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}) {
+		t.Fatalf("legacy counter nonce = %x", got)
+	}
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	accessory = NewLegacyConn(server, shared)
+	controller := &Conn{c: client, inKey: accessory.outKey, outKey: accessory.inKey, legacyNonce: true}
+	for i := 0; i < 2; i++ {
+		msg := []byte("encrypted message")
+		go func() { _, _ = controller.Write(msg) }()
+		buf := make([]byte, len(msg))
+		if _, err := io.ReadFull(accessory, buf); err != nil || !bytes.Equal(buf, msg) {
+			t.Fatalf("legacy incoming record %d: %x, %v", i, buf, err)
+		}
+	}
+}
+
 // TestConnTamper detects modification of an encrypted record.
 func TestConnTamper(t *testing.T) {
 	recKey := mustHexBytes(t, "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
@@ -111,17 +136,17 @@ func TestConnTamper(t *testing.T) {
 }
 
 // TestKeyDerivation locks in the control- and event-channel salt/info labels
-// and their read/write direction. The accessory must encrypt control data
-// with the write key and decrypt with the read key, while the event channel
-// inverts that: encrypt with the read key and decrypt with the write key.
+// and their read/write direction. The client encrypts control data with the
+// write key and decrypts with the read key. The accessory does the reverse;
+// it also sends event data with the read key and receives with the write key.
 func TestKeyDerivation(t *testing.T) {
 	shared := mustHexBytes(t, "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00")
 
 	ctrl := NewConn(discardConn{}, shared)
-	if want := hkdfSHA512(shared, []byte("Control-Salt"), []byte("Control-Write-Encryption-Key"), 32); !bytes.Equal(ctrl.outKey, want) {
+	if want := hkdfSHA512(shared, []byte("Control-Salt"), []byte("Control-Read-Encryption-Key"), 32); !bytes.Equal(ctrl.outKey, want) {
 		t.Errorf("control outKey: got %x want %x", ctrl.outKey, want)
 	}
-	if want := hkdfSHA512(shared, []byte("Control-Salt"), []byte("Control-Read-Encryption-Key"), 32); !bytes.Equal(ctrl.inKey, want) {
+	if want := hkdfSHA512(shared, []byte("Control-Salt"), []byte("Control-Write-Encryption-Key"), 32); !bytes.Equal(ctrl.inKey, want) {
 		t.Errorf("control inKey: got %x want %x", ctrl.inKey, want)
 	}
 	if bytes.Equal(ctrl.outKey, ctrl.inKey) {

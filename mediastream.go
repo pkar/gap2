@@ -245,7 +245,7 @@ func (h *mediaHandler) setupInitialAp2(cs *connState, cseq string, s *ap2SetupRe
 	// the advertised port. The listener is passed explicitly (rather than read
 	// from h.eventLn) to avoid racing with close() during teardown.
 	if len(cs.sessionKey) > 0 {
-		go h.serveEvent(ln, cs.sessionKey)
+		go h.serveEvent(ln, cs.sessionKey, cs.legacySetup)
 	}
 
 	body, err := buildAp2InitialResponse(port, localIP(cs.conn))

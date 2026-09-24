@@ -54,7 +54,7 @@ func (s *memStore) List() ([]Pairing, error) {
 
 func u32flags(v uint32) []byte {
 	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, v)
+	binary.LittleEndian.PutUint32(b, v)
 	return b
 }
 
@@ -146,6 +146,15 @@ func srpClient(t *testing.T, sess *PairSetupSession, clientPriv ed25519.PrivateK
 	if got, want := srpHash(false, A, M1, K).Bytes(), serverM2; !bytes.Equal(got, want) {
 		t.Fatalf("server M2 mismatch\n got %x\nwant %x", got, want)
 	}
+	if flags&FlagTransient != 0 {
+		if !m4Res.Done || !bytes.Equal(m4Res.SessionKey, K.Bytes()) {
+			t.Fatal("transient Pair Setup must finish at M4 with the SRP session key")
+		}
+		return m4Res.SessionKey
+	}
+	if m4Res.Done || len(m4Res.SessionKey) != 0 {
+		t.Fatal("persistent Pair Setup must continue through M5/M6")
+	}
 
 	// M5.
 	ikm := K.Bytes()
@@ -200,6 +209,62 @@ func TestPairSetupPersistent(t *testing.T) {
 	want := clientPriv.Public().(ed25519.PublicKey)
 	if !bytes.Equal(ltpk, want) {
 		t.Fatalf("stored LTPK mismatch\n got %x\nwant %x", ltpk, want)
+	}
+}
+
+func TestPairSetupM1VariableWidthFlags(t *testing.T) {
+	cases := []struct {
+		name      string
+		flags     []byte
+		transient bool
+		reject    bool
+	}{
+		{"empty", nil, false, false},
+		{"zero", []byte{0}, false, false},
+		{"one-byte transient", []byte{0x10}, true, false},
+		{"two-byte transient", []byte{0x10, 0}, true, false},
+		{"three-byte transient", []byte{0x10, 0, 0}, true, false},
+		{"four-byte transient", []byte{0x10, 0, 0, 0}, true, false},
+		{"split little-endian", []byte{0, 0, 0, 1}, false, true},
+		{"oversize", []byte{0x10, 0, 0, 0, 0}, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, err := NewIdentity(repeatReader{0x07}, "accessory-id")
+			if err != nil {
+				t.Fatal(err)
+			}
+			sess := NewPairSetupSession(repeatReader{0x05}, id, "3939", newMemStore())
+			// The one-byte case is the nine-byte M1 sent by a real Mac.
+			m1, err := encodeTLV([]tlv8.Item{
+				{Type: TLVMethod, Value: []byte{MethodPairSetup}},
+				{Type: TLVFlags, Value: tc.flags},
+				{Type: TLVState, Value: []byte{StateM1}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := sess.Handle(m1)
+			if tc.reject {
+				if err == nil {
+					t.Fatal("expected flags rejection")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("M1: %v", err)
+			}
+			if sess.transient != tc.transient {
+				t.Fatalf("transient = %v, want %v", sess.transient, tc.transient)
+			}
+			items, err := tlv8.Decode(res.Response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state, ok := getItem(items, TLVState); !ok || !bytes.Equal(state, []byte{StateM2}) {
+				t.Fatalf("M2 state = %v", state)
+			}
+		})
 	}
 }
 

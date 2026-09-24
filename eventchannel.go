@@ -18,7 +18,7 @@ import (
 // session is torn down. The event channel shares the control channel's shared
 // secret but derives independent keys with the event-specific salt and info
 // labels.
-func (h *mediaHandler) serveEvent(ln net.Listener, sessionKey []byte) {
+func (h *mediaHandler) serveEvent(ln net.Listener, sessionKey []byte, legacy bool) {
 	if ln == nil {
 		return
 	}
@@ -28,6 +28,12 @@ func (h *mediaHandler) serveEvent(ln net.Listener, sessionKey []byte) {
 	}
 	defer conn.Close()
 
+	if legacy {
+		// The main control socket stays plaintext for binary pairing, but
+		// events have their own salt and directional keys. Never reuse a main
+		// channel key/counter on this separate connection.
+		h.log.Debug("legacy event channel connected")
+	}
 	ec := hap.NewEventConn(conn, sessionKey)
 	if err := h.sendUpdateInfo(ec); err != nil {
 		h.log.Debug("event updateInfo failed", "err", err)

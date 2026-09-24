@@ -83,6 +83,17 @@ func TestPairingStorePersistsIdentity(t *testing.T) {
 	}
 }
 
+func TestAirPlayPairingID(t *testing.T) {
+	const stored = "00112233445566778899aabbccddeeff"
+	const want = "00112233-4455-4677-8899-aabbccddeeff"
+	if got := airplayPairingID(stored); got != want {
+		t.Fatalf("airplayPairingID = %q, want %q", got, want)
+	}
+	if got := macStyleID(stored); got != "00:11:22:33:44:55" {
+		t.Fatalf("device ID changed: %q", got)
+	}
+}
+
 func TestMacStyleID(t *testing.T) {
 	if got := macStyleID("00112233445566778899AABBCCDDEEFF"); got != "00:11:22:33:44:55" {
 		t.Fatalf("macStyleID = %q", got)

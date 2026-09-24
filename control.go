@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -98,6 +97,14 @@ func (s *controlServer) handleConn(conn net.Conn) {
 			return
 		}
 		_ = conn.SetReadDeadline(time.Time{})
+		cs.currentRequest = req
+		// Method and path are enough to diagnose pairing and media flow;
+		// never log pairing bodies or URL query parameters here.
+		path, _, _ := strings.Cut(req.target, "?")
+		if len(path) > 128 {
+			path = path[:128]
+		}
+		s.log.Debug("control request", "method", req.method, "path", path)
 
 		if err := s.handleRequest(cs, req); err != nil {
 			s.log.Debug("control request failed", "remote", conn.RemoteAddr(), "err", err)
@@ -109,6 +116,20 @@ func (s *controlServer) handleConn(conn net.Conn) {
 func (s *controlServer) handleRequest(cs *connState, req *ctlRequest) error {
 	switch req.method {
 	case "OPTIONS":
+		// An OPTIONS response rejected by a real sender is hard to diagnose
+		// without knowing which protocol variant it requested. Log only
+		// presence/format metadata; header values (notably Apple-Challenge)
+		// must never be retained in receiver logs.
+		s.log.Debug("control options", "rtsp", strings.HasPrefix(req.version, "RTSP/"),
+			"cseq", reqHeader(req, "CSeq") != "", "appleChallenge", reqHeader(req, "Apple-Challenge") != "")
+		if strings.HasPrefix(req.version, "RTSP/") {
+			// RAOP senders use Public to select a supported control path.
+			// A bare 200 can be rejected before pairing even begins.
+			return cs.writeRTSPResponse(reqHeader(req, "CSeq"), 200, "OK", map[string]string{
+				"Public": "ANNOUNCE, SETUP, RECORD, TEARDOWN, FLUSH, OPTIONS, GET_PARAMETER, SET_PARAMETER, POST, GET",
+				"Server": "AirTunes/366.0",
+			}, nil)
+		}
 		return cs.writeResponse(200, "OK", "text/plain", nil)
 	case "GET":
 		if req.target == "/info" {
@@ -123,7 +144,7 @@ func (s *controlServer) handleRequest(cs *connState, req *ctlRequest) error {
 		}
 	case "ANNOUNCE", "SETUP", "RECORD", "TEARDOWN", "FLUSH", "FLUSHBUFFERED",
 		"GET_PARAMETER", "SET_PARAMETER", "SETRATEANCHORI", "SETRATEANCHORTI", "SETPEERS", "SETPEERSX":
-		if cs.encrypted == nil {
+		if len(cs.sessionKey) == 0 {
 			return cs.writeResponse(401, "Unauthorized", "text/plain", nil)
 		}
 		return s.handleMedia(cs, req)
@@ -143,20 +164,37 @@ func (s *controlServer) infoPlist() ([]byte, error) {
 	return plist.Encode(s.infoValue())
 }
 
+// Advertise the implemented audio and pairing paths, not the old Apple TV
+// video/cloud/TLS flags. In particular PTP (bit 41) must be present for the
+// realtime AP2 stream; buffered audio (bit 40) is NOT implemented. FairPlay
+// SAP (bits 12/14) must remain off until /fp-setup and media-key decryption
+// are both supported. Some Apple Music senders require FairPlay and therefore
+// cannot stream with this capability set.
+const airplayFeatures uint64 = (1 << 9) | // AirPlay audio
+	(1 << 15) | (1 << 16) | (1 << 17) | // artwork, progress, DAAP metadata
+	(1 << 18) | (1 << 19) | (1 << 20) | // PCM, ALAC, AAC-LC
+	(1 << 22) | // unencrypted audio
+	(1 << 27) | // legacy pairing
+	(1 << 30) | // unified advertising /info
+	(1 << 41) | // PTP timing
+	(1 << 46) | (1 << 48) // HomeKit and transient pairing
+
 // infoValue builds the receiver info dictionary shared by the discovery
 // /info endpoint and the AP2 event-channel updateInfo push.
 func (s *controlServer) infoValue() *plist.Value {
 	mac := s.store.deviceID()
 	return plist.Dict(map[string]*plist.Value{
-		"deviceid": plist.String(mac),
-		"features": plist.Int(0x5A7FFFF7),
-		"flags":    plist.Int(0x4),
-		"model":    plist.String("AppleTV6,2"),
-		"name":     plist.String(s.cfg.Name),
-		"pi":       plist.String(string(s.identity.ID)),
-		"pk":       plist.String(base64.StdEncoding.EncodeToString(s.identity.PublicKey())),
-		"srcvers":  plist.String("366.0"),
-		"vv":       plist.Int(2),
+		"deviceID":        plist.String(mac),
+		"features":        plist.Int(int64(airplayFeatures)),
+		"statusFlags":     plist.Int(0x4),
+		"model":           plist.String("AppleTV6,2"),
+		"name":            plist.String(s.cfg.Name),
+		"pi":              plist.String(string(s.identity.ID)),
+		"psi":             plist.String(string(s.identity.ID)),
+		"pk":              plist.Data(s.identity.PublicKey()),
+		"protocolVersion": plist.String("1.1"),
+		"sourceVersion":   plist.String("366.0"),
+		"vv":              plist.Int(1),
 	})
 }
 
@@ -164,18 +202,34 @@ func (s *controlServer) handlePairSetup(cs *connState, req *ctlRequest) error {
 	if cs.encrypted != nil {
 		return cs.writeResponse(400, "Bad Request", "text/plain", nil)
 	}
+	// Legacy transient setup sends exactly 32 raw bytes and receives the
+	// accessory's long-term Ed25519 public key, without a TLV envelope.
+	if len(req.body) == 32 && cs.setup == nil && !strings.Contains(strings.ToLower(reqHeader(req, "Content-Type")), "pairing+tlv8") {
+		cs.legacySetup = true
+		return cs.writeResponse(200, "OK", "application/octet-stream", s.identity.PublicKey())
+	}
+	if cs.legacySetup {
+		return cs.writeResponse(400, "Bad Request", "text/plain", nil)
+	}
 	if cs.setup == nil {
 		cs.setup = hap.NewPairSetupSession(nil, s.identity, s.pin, s.store)
 	}
 	res, err := cs.setup.Handle(req.body)
 	if err != nil {
-		s.log.Debug("pair setup rejected", "err", err)
-		return cs.writeResponse(400, "Bad Request", "text/plain", nil)
+		// Malformed pairing bodies may still contain secrets. Log only bounded
+		// metadata, never the request payload. A bad SRP proof carries an M4
+		// authentication error: return that TLV rather than an empty HTTP 400.
+		s.log.Debug("pair setup rejected", "err", err, "bodyLength", len(req.body))
+		if len(res.Response) == 0 {
+			return cs.writeResponse(400, "Bad Request", "text/plain", nil)
+		}
+		return cs.writeTLV(res.Response)
 	}
 	if err := cs.writeTLV(res.Response); err != nil {
 		return err
 	}
 	if res.Done && len(res.SessionKey) > 0 {
+		s.log.Debug("pair setup authenticated")
 		return cs.upgrade(res.SessionKey)
 	}
 	return nil
@@ -184,6 +238,38 @@ func (s *controlServer) handlePairSetup(cs *connState, req *ctlRequest) error {
 func (s *controlServer) handlePairVerify(cs *connState, req *ctlRequest) error {
 	if cs.encrypted != nil {
 		return cs.writeResponse(400, "Bad Request", "text/plain", nil)
+	}
+	// Senders may open a fresh connection for verify after transient setup, or
+	// skip setup entirely when they already know our public key. M1's binary
+	// header distinguishes it from the TLV8 HomeKit pairing exchange.
+	legacyM1 := len(req.body) == 68 && bytes.Equal(req.body[:4], []byte{1, 0, 0, 0}) &&
+		!strings.Contains(strings.ToLower(reqHeader(req, "Content-Type")), "pairing+tlv8")
+	if cs.legacySetup || cs.legacyVerify != nil || legacyM1 {
+		if cs.verify != nil || cs.setup != nil {
+			return cs.writeResponse(400, "Bad Request", "text/plain", nil)
+		}
+		if cs.legacyVerify == nil {
+			cs.legacyVerify = hap.NewLegacyVerify(s.identity, nil)
+		}
+		reply, secret, err := cs.legacyVerify.Handle(req.body)
+		if err != nil {
+			s.log.Debug("legacy pair verify rejected", "err", err)
+			return cs.writeResponse(400, "Bad Request", "text/plain", nil)
+		}
+		cs.legacySetup = true
+		if err := cs.writeResponse(200, "OK", "application/octet-stream", reply); err != nil {
+			return err
+		}
+		if len(secret) != 0 {
+			s.log.Debug("legacy pair verify authenticated")
+			// A live legacy-pairing sender continues with plaintext RTSP after
+			// M3. Keep the verified shared secret for media, but do not enable
+			// HAP-style control framing on this connection.
+			cs.sessionKey = append(cs.sessionKey[:0], secret...)
+			return nil
+		}
+		s.log.Debug("legacy pair verify M1 accepted")
+		return nil
 	}
 	if cs.verify == nil {
 		cs.verify = hap.NewPairVerifySession(nil, s.identity, s.store)
@@ -209,16 +295,19 @@ type connState struct {
 	w    io.Writer
 	log  *slog.Logger
 
-	limits Limits
+	limits         Limits
+	currentRequest *ctlRequest
 
-	setup     *hap.PairSetupSession
-	verify    *hap.PairVerifySession
-	encrypted *hap.Conn
-	media     *mediaHandler
+	setup        *hap.PairSetupSession
+	verify       *hap.PairVerifySession
+	legacySetup  bool
+	legacyVerify *hap.LegacyVerify
+	encrypted    *hap.Conn
+	media        *mediaHandler
 
-	// sessionKey is the shared secret established by pair setup/verify. It
-	// feeds both the control channel (via hap.Conn) and the AP2 event channel
-	// (via hap.NewEventConn).
+	// sessionKey is the verified pairing secret. HAP uses it for encrypted
+	// control and events; legacy binary pairing leaves RTSP plaintext, while
+	// retaining the secret for media-channel key derivation.
 	sessionKey []byte
 }
 
@@ -239,6 +328,16 @@ func (cs *connState) writeTLV(body []byte) error {
 }
 
 func (cs *connState) writeResponse(status int, reason, contentType string, body []byte) error {
+	if cs.currentRequest != nil && strings.HasPrefix(cs.currentRequest.version, "RTSP/") {
+		headers := make(map[string]string)
+		if contentType != "" {
+			headers["Content-Type"] = contentType
+		}
+		return cs.writeRTSPResponse(reqHeader(cs.currentRequest, "CSeq"), status, reason, headers, body)
+	}
+	if cs.legacySetup && len(cs.sessionKey) > 0 && cs.log != nil {
+		cs.log.Debug("legacy control response", "status", status)
+	}
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "HTTP/1.1 %d %s\r\n", status, reason)
 	fmt.Fprintf(&b, "Content-Length: %d\r\n", len(body))
@@ -250,12 +349,16 @@ func (cs *connState) writeResponse(status int, reason, contentType string, body 
 	return writeAll(cs.w, b.Bytes())
 }
 
-// writeRTSPResponse writes an RTSP/1.0 response over the encrypted control
-// channel, echoing the request's CSeq.
+// writeRTSPResponse writes an RTSP/1.0 response, echoing the request's CSeq.
 func (cs *connState) writeRTSPResponse(cseq string, status int, reason string, headers map[string]string, body []byte) error {
+	if cs.legacySetup && len(cs.sessionKey) > 0 && cs.log != nil {
+		cs.log.Debug("legacy control response", "status", status)
+	}
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "RTSP/1.0 %d %s\r\n", status, reason)
-	fmt.Fprintf(&b, "CSeq: %s\r\n", cseq)
+	if cseq != "" {
+		fmt.Fprintf(&b, "CSeq: %s\r\n", cseq)
+	}
 	for k, v := range headers {
 		fmt.Fprintf(&b, "%s: %s\r\n", k, v)
 	}

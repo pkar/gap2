@@ -2,6 +2,7 @@ package hap
 
 import (
 	"bytes"
+	"crypto/sha512"
 	"encoding/hex"
 	"math/big"
 	"testing"
@@ -129,6 +130,68 @@ func TestSRPInterop(t *testing.T) {
 	}
 	if srv.m2.Cmp(srpHash(false, clientPub, clientM1, controllerKey)) != 0 {
 		t.Fatal("server M2 does not match controller expectation")
+	}
+}
+
+// TestSRPLeadingZeroDigest exercises a case where H(username:password)
+// starts with 0x00. The independent byte-oriented controller must not lose
+// that byte when calculating x; the proof and transport key stay 64 bytes.
+func TestSRPLeadingZeroDigest(t *testing.T) {
+	input := append(make([]byte, 15), 0x05) // 16-byte salt with leading zeros
+	input = append(input, bytes.Repeat([]byte{0x39}, 64)...)
+	const password = "test-289" // SHA-512("Pair-Setup:test-289") starts with 00
+	srv, err := newSRPServer(bytes.NewReader(input), usernamePairSetup, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := func(parts ...[]byte) []byte {
+		h := sha512.New()
+		for _, part := range parts {
+			h.Write(part)
+		}
+		return h.Sum(nil)
+	}
+	inner := hash([]byte("Pair-Setup:" + password))
+	if inner[0] != 0 {
+		t.Fatal("fixture has no leading zero")
+	}
+	x := new(big.Int).SetBytes(hash(srv.salt.Bytes(), inner))
+	v := new(big.Int).Exp(srpG, x, srpN)
+	if v.Cmp(srv.verifier) != 0 {
+		t.Fatal("server discarded a leading zero in the password digest")
+	}
+	a := big.NewInt(123456)
+	A := new(big.Int).Exp(srpG, a, srpN)
+	if err := srv.setClientPublic(A.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	B := srv.public
+	pad := func(n *big.Int) []byte { return n.FillBytes(make([]byte, padLen)) }
+	u := new(big.Int).SetBytes(hash(pad(A), pad(B)))
+	k := new(big.Int).SetBytes(hash(pad(srpN), pad(srpG)))
+	base := new(big.Int).Sub(B, new(big.Int).Mul(k, v))
+	base.Mod(base, srpN)
+	exponent := new(big.Int).Add(a, new(big.Int).Mul(u, x))
+	S := new(big.Int).Exp(base, exponent, srpN)
+	K := hash(S.Bytes())
+	if !bytes.Equal(srv.sessionKeyBytes(), K) {
+		t.Fatal("session key differs from byte-oriented controller")
+	}
+	hNG := hash(srpN.Bytes())
+	hG := hash(srpG.Bytes())
+	for i := range hNG {
+		hNG[i] ^= hG[i]
+	}
+	M1 := hash(hNG, hash([]byte(usernamePairSetup)), srv.salt.Bytes(), A.Bytes(), B.Bytes(), K)
+	if !srv.verifyProof(M1) {
+		t.Fatal("rejected independent byte-oriented proof")
+	}
+	M2 := hash(A.Bytes(), M1, K)
+	if !bytes.Equal(srv.proofBytes(), M2) {
+		t.Fatal("server M2 differs from byte-oriented controller")
+	}
+	if srv.verifyProof(append([]byte{0}, M1...)) {
+		t.Fatal("accepted noncanonical proof")
 	}
 }
 
