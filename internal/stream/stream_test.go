@@ -3,6 +3,7 @@ package stream
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -180,5 +181,74 @@ func TestStreamAACEndToEnd(t *testing.T) {
 		if v != 0 {
 			t.Fatalf("sample %d = %d, want 0", i, v)
 		}
+	}
+}
+
+// TestStreamALACEndToEnd drives a real uncompressed mono ALAC frame through
+// the pipeline: SDP -> NewDecoder -> Announce/Setup/Record -> RTP ingest ->
+// ALAC decode -> PCM sink.
+func TestStreamALACEndToEnd(t *testing.T) {
+	m := &sdp.Media{
+		PayloadType: 96,
+		Encoding:    "AppleLossless",
+		ALAC: &sdp.ALACConfig{
+			FrameLength: 4096,
+			BitDepth:    16,
+			PB:          40,
+			MB:          10,
+			KB:          14,
+			Channels:    1,
+			SampleRate:  44100,
+		},
+	}
+	dec, err := NewDecoder(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &recordingSink{}
+	s := New("1", dec, sink)
+
+	if err := s.Announce(m); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := ParseTransport("RTP/AVP/UDP;unicast;client_port=6000-6001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Setup(tr, 7000); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Record(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Uncompressed mono frame: SCE, one sample, value 1234.
+	const sample = int16(1234)
+	var bits string
+	bits += "000"          // SCE element type
+	bits += "0000"         // element instance tag
+	bits += "000000000000" // unused header bits
+	bits += "1"            // has_size
+	bits += "00"           // extra_bits
+	bits += "1"            // uncompressed
+	bits += fmt.Sprintf("%032b", 1)
+	bits += fmt.Sprintf("%016b", uint16(sample))
+	bits += "111" // TYPE_END
+
+	if err := s.IngestRTP(context.Background(), rtpPacket(packBits(bits))); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.blocks) != 1 {
+		t.Fatalf("got %d blocks, want 1", len(sink.blocks))
+	}
+	b := sink.blocks[0]
+	if b.Format.Rate != 44100 || b.Format.Channels != 1 {
+		t.Fatalf("block format = %+v, want 44100 Hz mono", b.Format)
+	}
+	if b.Frames() != 1 {
+		t.Fatalf("frames = %d, want 1", b.Frames())
+	}
+	if got := int16(b.Data[0]) | int16(b.Data[1])<<8; got != sample {
+		t.Fatalf("sample = %d, want %d", got, sample)
 	}
 }

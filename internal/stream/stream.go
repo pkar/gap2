@@ -205,21 +205,30 @@ func (s *Stream) IngestRTP(ctx context.Context, pkt []byte) error {
 	if media == nil {
 		return fmt.Errorf("stream: %w: no announced media", ErrUnsupported)
 	}
-	if media.Encoding != "mpeg4-generic" {
-		return fmt.Errorf("stream: %w: %s ingest not implemented", ErrUnsupported, media.Encoding)
-	}
-	aus, err := rtp.ParseAACPayload(p.Payload)
-	if err != nil {
-		return err
-	}
-	for _, au := range aus {
-		block, err := s.decoder.Decode(au.Data)
+	switch media.Encoding {
+	case "mpeg4-generic":
+		aus, err := rtp.ParseAACPayload(p.Payload)
 		if err != nil {
 			return err
 		}
-		if err := s.sink.Write(ctx, block); err != nil {
+		for _, au := range aus {
+			block, err := s.decoder.Decode(au.Data)
+			if err != nil {
+				return err
+			}
+			if err := s.sink.Write(ctx, block); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "AppleLossless":
+		// AirPlay packs exactly one ALAC frame per RTP packet.
+		block, err := s.decoder.Decode(p.Payload)
+		if err != nil {
 			return err
 		}
+		return s.sink.Write(ctx, block)
+	default:
+		return fmt.Errorf("stream: %w: %s ingest not implemented", ErrUnsupported, media.Encoding)
 	}
-	return nil
 }
