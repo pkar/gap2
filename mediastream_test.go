@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"log/slog"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -366,6 +367,29 @@ func TestNativeAP2RecordBeforeStreamSetup(t *testing.T) {
 			}
 			if !h.mediaStarted || !strings.Contains(wire.String(), "200 OK") {
 				t.Fatal("replacement stream failed:", wire.String())
+			}
+		})
+	}
+}
+
+func TestPlaybackVolumeMapping(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		input   float64
+		mapFunc func(float64) float64
+		want    float64
+	}{
+		{"default", -30, nil, -30},
+		{"mapped", -29, func(db float64) float64 { return db - 20 }, -49},
+		{"mute", -144, func(float64) float64 { return 0 }, -144},
+		{"clampHigh", -10, func(float64) float64 { return 10 }, 0},
+		{"clampLow", -10, func(float64) float64 { return -150 }, -144},
+		{"invalid", -10, func(float64) float64 { return math.NaN() }, -10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := mediaHandler{cfg: Config{VolumeMap: tc.mapFunc}, volume: tc.input}
+			if got := h.playbackVolume(); got != tc.want {
+				t.Fatalf("playbackVolume() = %v, want %v", got, tc.want)
 			}
 		})
 	}

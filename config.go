@@ -35,6 +35,12 @@ type Config struct {
 	// OutputOffset adjusts synchronized playback by up to 500 ms in either
 	// direction. Positive plays later; negative compensates downstream delay.
 	OutputOffset time.Duration
+	// VolumeMap optionally maps a sender's volume in dB to playback gain in
+	// dB. Nil preserves the sender's gain. The reported volume is always the
+	// unmodified sender value; -144 dB mute cannot be remapped. Non-finite
+	// results fall back to the sender value and finite results are clamped to
+	// [-144, 0]. Keep the callback deterministic and safe for concurrent use.
+	VolumeMap func(db float64) float64
 
 	// PairingsPath is the file used to persist the accessory identity and
 	// controller pairings. Empty means pairings are in-memory only and do not

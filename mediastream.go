@@ -122,6 +122,19 @@ func (h *mediaHandler) closeAudio() {
 	h.mediaStarted, h.streamType = false, 0
 }
 
+// playbackVolume applies the receiver's output curve without changing the
+// sender's reported volume or its -144 dB mute setting.
+func (h *mediaHandler) playbackVolume() float64 {
+	if h.volume <= -144 || h.cfg.VolumeMap == nil {
+		return h.volume
+	}
+	mapped := h.cfg.VolumeMap(h.volume)
+	if math.IsNaN(mapped) || math.IsInf(mapped, 0) {
+		return h.volume
+	}
+	return math.Max(-144, math.Min(0, mapped))
+}
+
 // handleMedia dispatches one RTSP media request on an encrypted control
 // connection.
 func (s *controlServer) handleMedia(cs *connState, req *ctlRequest) error {
@@ -158,7 +171,7 @@ func (s *controlServer) handleMedia(cs *connState, req *ctlRequest) error {
 			}
 			h.volume = volume
 			if h.gain != nil {
-				h.gain.SetDB(volume)
+				h.gain.SetDB(h.playbackVolume())
 			}
 		}
 		return cs.writeRTSPResponse(reqHeader(req, "CSeq"), 200, "OK", nil, nil)
@@ -195,7 +208,7 @@ func (h *mediaHandler) announce(cs *connState, req *ctlRequest) error {
 		h.log.Debug("media sink open failed", "err", err)
 		return cs.writeRTSPResponse(cseq, 500, "Internal Server Error", nil, nil)
 	}
-	h.gain = pcm.NewGain(sink, h.volume)
+	h.gain = pcm.NewGain(sink, h.playbackVolume())
 	h.sink = h.gain
 
 	// Wrap the output sink in a PTP-synchronized scheduler so decoded blocks
@@ -456,7 +469,7 @@ func (h *mediaHandler) openNativeStream(entry *plist.Value) error {
 	if err != nil {
 		return err
 	}
-	h.gain = pcm.NewGain(sink, h.volume)
+	h.gain = pcm.NewGain(sink, h.playbackVolume())
 	var out pcm.Sink = h.gain
 	if h.clock != nil {
 		h.playout = playout.NewSynced(h.gain, h.clock.FrameLocalTime, ptp.MonotonicNanos)
