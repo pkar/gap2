@@ -35,6 +35,14 @@ func NewConverter(sink Sink, output Format) (*Converter, error) {
 	return &Converter{sink: sink, output: output}, nil
 }
 
+// SetVolumeDB forwards output gain without quantizing samples before conversion.
+func (c *Converter) SetVolumeDB(db float64) bool {
+	if sink, ok := c.sink.(VolumeSink); ok {
+		return sink.SetVolumeDB(db)
+	}
+	return false
+}
+
 func conversionFormat(f Format) error {
 	if f.Format != S16LE || f.Rate < 8000 || f.Rate > 192000 || f.Channels < 1 || f.Channels > 8 {
 		return fmt.Errorf("pcm: unsupported conversion format %s", f)

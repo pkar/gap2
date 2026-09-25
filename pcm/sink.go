@@ -44,3 +44,11 @@ type Sink interface {
 type Factory interface {
 	Open(ctx context.Context, format Format) (Sink, error)
 }
+
+// VolumeSink optionally applies gain at the output's native precision. Returning
+// true transfers all attenuation, including mute, to the sink. Support must be
+// stable for the sink's lifetime; false leaves software S16LE gain in charge.
+// SetVolumeDB must be safe to call concurrently with Write and Flush.
+type VolumeSink interface {
+	SetVolumeDB(db float64) bool
+}

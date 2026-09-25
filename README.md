@@ -25,6 +25,11 @@ Linux amd64/arm64 uses native ALSA playback. Other platforms can capture S16LE P
 
 ## Support
 
+Custom output sinks can implement `pcm.VolumeSink` to apply attenuation at
+their native precision. The receiver then preserves S16LE samples through
+resampling and delegates gain, including mute, to that sink. Outputs without
+this capability keep the default S16LE software gain.
+
 - Encrypted AirPlay 2 control and audio, AAC-LC and ALAC, stream replacement, and buffered TCP reconnects.
 - Stereo playback with resampling and surround downmix; supported 5.1/7.1 streams can also retain their channels on a matching device.
 - PTP-timed playback with hardware queue correction; `-output-offset` adjusts for downstream speaker delay.

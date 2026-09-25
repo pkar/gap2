@@ -26,6 +26,11 @@ func (g *Gain) SetDB(db float64) {
 	if math.IsNaN(db) || math.IsInf(db, 0) || db > 0 {
 		return
 	}
+	if sink, ok := g.Sink.(VolumeSink); ok && sink.SetVolumeDB(db) {
+		// Preserve source precision until the final output stage.
+		g.value.Store(math.Float64bits(1))
+		return
+	}
 	v := 0.0
 	if db > -144 {
 		v = math.Pow(10, db/20)
