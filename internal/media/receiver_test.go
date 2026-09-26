@@ -3,6 +3,7 @@ package media
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -131,5 +132,67 @@ func TestReceiverServeHandlerError(t *testing.T) {
 	})
 	if err != context.Canceled {
 		t.Fatalf("Serve = %v, want context.Canceled", err)
+	}
+}
+
+type drainSignalConn struct {
+	*fakeConn
+	remaining int
+	drained   chan struct{}
+}
+
+func (c *drainSignalConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := c.fakeConn.ReadFrom(p)
+	if err == nil {
+		c.remaining--
+		if c.remaining == 0 {
+			close(c.drained)
+		}
+	}
+	return n, addr, err
+}
+
+func TestReceiverReadsAheadWhilePlaybackWaits(t *testing.T) {
+	packets := make([][]byte, 300)
+	for i := range packets {
+		packets[i] = bytes.Repeat([]byte{byte(i)}, 1400)
+	}
+	conn := &drainSignalConn{fakeConn: newFakeConn(packets...), remaining: len(packets), drained: make(chan struct{})}
+	recv := newReceiver(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	var received int
+	go func() {
+		done <- recv.Serve(ctx, func(packet []byte) error {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			if received >= len(packets) || !bytes.Equal(packet, packets[received]) {
+				return fmt.Errorf("packet %d corrupted or reordered", received)
+			}
+			received++
+			if received == len(packets) {
+				cancel()
+			}
+			return nil
+		})
+	}()
+	select {
+	case <-conn.drained:
+	case <-ctx.Done():
+		close(release)
+		<-done
+		t.Fatal("UDP receive stopped while playout waited")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if received != len(packets) {
+		t.Fatalf("received %d packets, want %d", received, len(packets))
 	}
 }

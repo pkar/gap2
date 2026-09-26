@@ -59,19 +59,33 @@ func (r *Receiver) Addr() net.Addr {
 	return r.conn.LocalAddr()
 }
 
-// Serve reads datagrams until ctx is cancelled or the connection is closed.
+// Serve reads datagrams ahead of playout until ctx is cancelled or the
+// connection is closed. Scheduling a future presentation must not stop draining
+// the UDP socket: unlike TCP, a full kernel receive queue loses audio packets.
 // For each datagram it calls handle with a slice valid only for the duration
 // of the call; handle must not retain it. A nil return means clean shutdown;
 // otherwise the read or handler error is returned.
 func (r *Receiver) Serve(ctx context.Context, handle func(pkt []byte) error) error {
+	ctx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(ctx, func() { _ = r.conn.Close() })
-	defer stop()
+	defer func() {
+		cancel()
+		_ = r.conn.Close() // also unblock read-ahead when the handler fails
+		stop()
+	}()
+	err := queuePackets(ctx, r.read, handle)
+	if ctx.Err() != nil {
+		return nil
+	}
+	return err
+}
 
+func (r *Receiver) read(handle func([]byte) error) error {
 	buf := make([]byte, maxDatagram)
 	for {
 		n, _, err := r.conn.ReadFrom(buf)
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			return err
@@ -255,6 +269,15 @@ func (s *Session) serveBufferedConnection(ctx context.Context) error {
 // while frames wait for their PTP deadlines. Both bytes and packet count are
 // bounded; cancellation interrupts either side of the queue.
 func queueBuffered(ctx context.Context, r io.Reader, handle func([]byte) error) error {
+	return queuePackets(ctx, func(enqueue func([]byte) error) error {
+		return readBuffered(r, enqueue)
+	}, handle)
+}
+
+// queuePackets bounds read-ahead by both encoded bytes and packet count. It
+// copies each packet before the transport reuses its read buffer. The caller
+// must interrupt a blocked transport read when ctx is cancelled or this returns.
+func queuePackets(ctx context.Context, read func(func([]byte) error) error, handle func([]byte) error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	packets := make(chan []byte, 2048)
@@ -263,7 +286,7 @@ func queueBuffered(ctx context.Context, r io.Reader, handle func([]byte) error) 
 	var queued atomic.Int64
 	go func() {
 		defer close(packets)
-		result <- readBuffered(r, func(packet []byte) error {
+		result <- read(func(packet []byte) error {
 			for queued.Load()+int64(len(packet)+2) > BufferedAudioBytes {
 				select {
 				case <-ctx.Done():

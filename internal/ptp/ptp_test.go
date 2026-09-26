@@ -113,7 +113,10 @@ func TestParseAnnounce(t *testing.T) {
 	b[6] = 0x06
 	b[7] = 0x08
 	gm := [8]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11}
-	copy(b[headerSize+20:], gm[:])
+	// Neighbouring fields are non-zero so an off-by-one read is visible.
+	b[headerSize+18] = 0xf8 // grandmasterPriority2
+	copy(b[headerSize+19:], gm[:])
+	b[headerSize+27], b[headerSize+28] = 0x00, 0x01 // stepsRemoved
 
 	m, err := Parse(b)
 	if err != nil {

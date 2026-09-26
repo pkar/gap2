@@ -156,7 +156,10 @@ func Parse(b []byte) (Message, error) {
 			return Message{}, ErrShort
 		}
 		m.Origin = parseTimestamp(body)
-		copy(m.Grandmaster[:], body[20:28])
+		// IEEE 1588 Announce body: originTimestamp(10) currentUtcOffset(2)
+		// reserved(1) priority1(1) clockQuality(4) priority2(1), then
+		// grandmasterIdentity(8) at offset 19, stepsRemoved(2), timeSource(1).
+		copy(m.Grandmaster[:], body[19:27])
 	}
 	return m, nil
 }

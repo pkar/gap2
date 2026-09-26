@@ -96,7 +96,8 @@ func TestListenerHandleAnnounce(t *testing.T) {
 	b[4] = DefaultDomain
 	b[6] = 0x06
 	b[7] = 0x08
-	copy(b[headerSize+20:], gm[:])
+	b[headerSize+18] = 0xf8
+	copy(b[headerSize+19:], gm[:])
 	l.handle(b)
 
 	if got := c.Info(); got.MasterID != gm {
