@@ -1,6 +1,7 @@
 package airplay2
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -59,5 +60,17 @@ func TestLimitsWithDefaults(t *testing.T) {
 func TestConfigValidateEmptyName(t *testing.T) {
 	if err := (Config{ListenAddr: ":7000"}).Validate(); err == nil {
 		t.Fatal("expected empty name to fail validation")
+	}
+}
+
+func TestConfigValidateLongName(t *testing.T) {
+	c := DefaultConfig()
+	c.Name = strings.Repeat("n", maxNameLen)
+	if err := c.Validate(); err != nil {
+		t.Fatalf("%d-byte name: %v", maxNameLen, err)
+	}
+	c.Name += "n"
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for a name that cannot fit the RAOP mDNS label")
 	}
 }

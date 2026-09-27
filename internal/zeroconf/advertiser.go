@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 )
 
@@ -65,6 +66,13 @@ func New(cfg Config) (*Advertiser, error) {
 	}
 	if len(cfg.Services) == 0 {
 		return nil, fmt.Errorf("zeroconf: no services configured")
+	}
+	for _, svc := range cfg.Services {
+		// An unencodable instance name would make every announcement and
+		// response fail to marshal, leaving the service silently invisible.
+		if n := len(svc.Instance); n == 0 || n > 63 {
+			return nil, fmt.Errorf("zeroconf: instance name %q must be 1 to 63 bytes", svc.Instance)
+		}
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -264,7 +272,7 @@ func (a *Advertiser) announcement() *dnsMessage {
 	msg := &dnsMessage{flags: flagResponse | flagAuthoritative}
 	for _, svc := range a.cfg.Services {
 		typeName := svc.Type + ".local"
-		instName := svc.Instance + "." + typeName
+		instName := escapeLabel(svc.Instance) + "." + typeName
 		rdata, err := nameRData(instName)
 		if err != nil {
 			continue
@@ -295,10 +303,11 @@ func (a *Advertiser) buildResponse(q *dnsMessage) *dnsMessage {
 		}
 		for _, svc := range a.cfg.Services {
 			typeName := svc.Type + ".local"
-			instName := svc.Instance + "." + typeName
+			instName := escapeLabel(svc.Instance) + "." + typeName
 
-			switch question.name {
-			case typeName:
+			// DNS names compare case-insensitively (RFC 6762 section 16).
+			switch name := question.name; {
+			case strings.EqualFold(name, typeName):
 				if question.typ == typePTR || question.typ == typeAny {
 					rdata, err := nameRData(instName)
 					if err == nil {
@@ -312,9 +321,9 @@ func (a *Advertiser) buildResponse(q *dnsMessage) *dnsMessage {
 					}
 					msg.additional = append(msg.additional, a.serviceRecords(svc, instName)...)
 				}
-			case instName:
+			case strings.EqualFold(name, instName):
 				msg.answers = append(msg.answers, a.instanceRecords(svc, question.typ, instName, hostName)...)
-			case hostName:
+			case strings.EqualFold(name, hostName):
 				if question.typ == typeA || question.typ == typeAny {
 					msg.answers = append(msg.answers, a.addressRecords(hostName)...)
 				}

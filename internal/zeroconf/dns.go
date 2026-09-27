@@ -69,21 +69,63 @@ type dnsMessage struct {
 	additional []dnsRecord
 }
 
+// escapeLabel renders one DNS label in presentation form, escaping dots and
+// backslashes so a label such as "Kitchen 2.0" stays a single label when the
+// name is later split for encoding.
+func escapeLabel(label string) string {
+	if !strings.ContainsAny(label, `.\`) {
+		return label
+	}
+	var b strings.Builder
+	for i := 0; i < len(label); i++ {
+		if c := label[i]; c == '.' || c == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(label[i])
+	}
+	return b.String()
+}
+
+// splitName splits a presentation-form name on unescaped dots and removes
+// the escapes.
+func splitName(name string) []string {
+	var labels []string
+	var cur []byte
+	for i := 0; i < len(name); i++ {
+		switch c := name[i]; {
+		case c == '\\' && i+1 < len(name):
+			i++
+			cur = append(cur, name[i])
+		case c == '.':
+			labels = append(labels, string(cur))
+			cur = cur[:0]
+		default:
+			cur = append(cur, c)
+		}
+	}
+	return append(labels, string(cur))
+}
+
 func encodeName(w *bytes.Buffer, name string) error {
 	if name == "" {
 		w.WriteByte(0)
 		return nil
 	}
-	if len(name) > 253 {
-		return errNameTooLong
-	}
-	for _, label := range strings.Split(name, ".") {
+	labels := splitName(name)
+	wire := 1
+	for _, label := range labels {
 		if len(label) == 0 {
 			return errNameTooLong
 		}
 		if len(label) > 63 {
 			return errLabelTooLong
 		}
+		wire += 1 + len(label)
+	}
+	if wire > 255 {
+		return errNameTooLong
+	}
+	for _, label := range labels {
 		w.WriteByte(byte(len(label)))
 		w.WriteString(label)
 	}
@@ -232,7 +274,7 @@ func decodeName(packet []byte, offset, depth int) (string, int, error) {
 		if next+1+length > len(packet) {
 			return "", 0, errTruncated
 		}
-		labels = append(labels, string(packet[next+1:next+1+length]))
+		labels = append(labels, escapeLabel(string(packet[next+1:next+1+length])))
 		next += 1 + length
 	}
 }

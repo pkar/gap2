@@ -136,6 +136,10 @@ func (l Limits) withDefaults() Limits {
 	return l
 }
 
+// maxNameLen is the longest receiver name that fits the RAOP mDNS instance
+// label.
+const maxNameLen = 63 - len("001122334455@")
+
 // Validate checks a raw configuration for syntactic validity. It does not
 // perform network or interface I/O.
 func (c Config) Validate() error {
@@ -150,6 +154,11 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.Name) == "" {
 		return fmt.Errorf("%w: name is empty", ErrNotConfigured)
+	}
+	// The RAOP instance is "<12 hex digits>@<name>" and must fit one 63-byte
+	// DNS label.
+	if len(c.Name) > maxNameLen {
+		return fmt.Errorf("%w: name must be at most %d bytes", ErrNotConfigured, maxNameLen)
 	}
 	if _, _, err := net.SplitHostPort(c.ListenAddr); err != nil {
 		return fmt.Errorf("%w: listen address %q: %v", ErrNotConfigured, c.ListenAddr, err)

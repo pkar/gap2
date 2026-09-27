@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -181,4 +182,56 @@ func TestBuildResponseInstanceAndHost(t *testing.T) {
 			t.Fatalf("A address = %s", got)
 		}
 	})
+}
+
+// Instance names may contain dots; they must stay one DNS label and still
+// match queries, which also compare case-insensitively.
+func TestInstanceNameWithDotAndCase(t *testing.T) {
+	a, err := New(Config{
+		Hostname: "001122334455",
+		Port:     7000,
+		IPv4s:    []net.IP{net.ParseIP("192.0.2.10").To4()},
+		Services: []Service{{Type: "_airplay._tcp", Instance: "Kitchen 2.0", TXT: []string{"a=b"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ann := a.announcement()
+	packet, err := ann.marshal()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// The instance must appear on the wire as one 11-byte label.
+	if !bytes.Contains(packet, append([]byte{11}, "Kitchen 2.0"...)) {
+		t.Fatalf("instance label not encoded as a single label: %x", packet)
+	}
+
+	var q bytes.Buffer
+	q.Write([]byte{0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0})
+	q.Write([]byte{11})
+	q.WriteString("Kitchen 2.0")
+	for _, l := range []string{"_AIRPLAY", "_tcp", "LOCAL"} {
+		q.WriteByte(byte(len(l)))
+		q.WriteString(l)
+	}
+	q.Write([]byte{0, 0, 33, 0, 1}) // SRV, IN
+	query, err := parseDNS(q.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := a.buildResponse(query)
+	if len(resp.answers) != 1 || resp.answers[0].typ != typeSRV {
+		t.Fatalf("SRV query got %d answers: %+v", len(resp.answers), resp.answers)
+	}
+}
+
+func TestNewRejectsLongInstance(t *testing.T) {
+	_, err := New(Config{
+		Hostname: "h",
+		Port:     7000,
+		Services: []Service{{Type: "_raop._tcp", Instance: strings.Repeat("x", 64)}},
+	})
+	if err == nil {
+		t.Fatal("expected error for 64-byte instance label")
+	}
 }
