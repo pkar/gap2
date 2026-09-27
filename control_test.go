@@ -10,10 +10,12 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -435,5 +437,20 @@ func TestControlUnknownRoute(t *testing.T) {
 	resp := exchange(t, conn, "POST /not-a-route HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
 	if statusCode(resp.status) != "501" {
 		t.Fatalf("status = %q, want 501", resp.status)
+	}
+}
+
+// An unauthenticated connection is closed after PairTimeout even while it
+// keeps sending cheap requests, so idle clients cannot hold every slot.
+func TestControlClosesUnpairedConnAfterPairTimeout(t *testing.T) {
+	s := newTestControlServer(t)
+	s.cfg.Limits.PairTimeout = 100 * time.Millisecond
+	conn := startPipeConn(t, s)
+	if got := statusCode(exchange(t, conn, "OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n").status); got != "200" {
+		t.Fatalf("OPTIONS status %q", got)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("connection still open after PairTimeout: err = %v", err)
 	}
 }

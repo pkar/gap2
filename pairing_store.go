@@ -12,7 +12,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/pkar/gap2/internal/hap"
 )
@@ -145,33 +147,63 @@ func (s *pairingStore) Get(identifier string) ([]byte, bool, error) {
 	return nil, false, nil
 }
 
+// maxPairings bounds the persisted controller list. HAP accessories must
+// hold at least 16; each Put rewrites and fsyncs the whole file, so an
+// unbounded list would let repeated pair setups grow it without limit.
+const maxPairings = 32
+
+// maxPairingIDLen bounds controller identifiers, which are normally a
+// 36-byte UUID.
+const maxPairingIDLen = 64
+
+var (
+	errPairingID   = errors.New("airplay2: invalid pairing identifier")
+	errMaxPairings = errors.New("airplay2: pairing store is full")
+)
+
 func (s *pairingStore) Put(identifier string, ltpk []byte, admin bool) error {
+	// JSON replaces invalid UTF-8 with U+FFFD, so such an identifier would
+	// not match itself after a restart.
+	if identifier == "" || len(identifier) > maxPairingIDLen || !utf8.ValidString(identifier) {
+		return errPairingID
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	old := s.data.Pairings
+	next := slices.Clone(old)
 	enc := base64.StdEncoding.EncodeToString(ltpk)
-	for i := range s.data.Pairings {
-		if s.data.Pairings[i].Identifier == identifier {
-			s.data.Pairings[i].LTPK = enc
-			s.data.Pairings[i].Admin = admin
-			return s.saveLocked()
-		}
+	i := slices.IndexFunc(next, func(p persistedPairing) bool { return p.Identifier == identifier })
+	switch {
+	case i >= 0:
+		next[i].LTPK = enc
+		next[i].Admin = admin
+	case len(next) >= maxPairings:
+		return errMaxPairings
+	default:
+		next = append(next, persistedPairing{Identifier: identifier, LTPK: enc, Admin: admin})
 	}
-	s.data.Pairings = append(s.data.Pairings, persistedPairing{
-		Identifier: identifier,
-		LTPK:       enc,
-		Admin:      admin,
-	})
-	return s.saveLocked()
+	return s.commitLocked(old, next)
 }
 
 func (s *pairingStore) Delete(identifier string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := range s.data.Pairings {
-		if s.data.Pairings[i].Identifier == identifier {
-			s.data.Pairings = append(s.data.Pairings[:i], s.data.Pairings[i+1:]...)
-			return s.saveLocked()
-		}
+	old := s.data.Pairings
+	i := slices.IndexFunc(old, func(p persistedPairing) bool { return p.Identifier == identifier })
+	if i < 0 {
+		return nil
+	}
+	return s.commitLocked(old, slices.Delete(slices.Clone(old), i, i+1))
+}
+
+// commitLocked installs next and persists it, restoring old if the save
+// fails so memory never trusts a pairing that was not stored (or keeps
+// trusting one whose removal was reported as failed).
+func (s *pairingStore) commitLocked(old, next []persistedPairing) error {
+	s.data.Pairings = next
+	if err := s.saveLocked(); err != nil {
+		s.data.Pairings = old
+		return err
 	}
 	return nil
 }

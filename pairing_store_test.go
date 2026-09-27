@@ -1,6 +1,7 @@
 package airplay2
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -101,3 +102,60 @@ func TestMacStyleID(t *testing.T) {
 }
 
 var _ hap.Store = (*pairingStore)(nil)
+
+func TestPairingStoreLimits(t *testing.T) {
+	s, err := loadPairingStore("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ltpk := make([]byte, 32)
+	for _, id := range []string{"", string(make([]byte, maxPairingIDLen+1)), "bad\xff"} {
+		if err := s.Put(id, ltpk, true); err == nil {
+			t.Errorf("Put(%q) accepted an invalid identifier", id)
+		}
+	}
+	for i := range maxPairings {
+		if err := s.Put(fmt.Sprintf("controller-%d", i), ltpk, false); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+	if err := s.Put("one-too-many", ltpk, false); err == nil {
+		t.Fatal("Put beyond maxPairings succeeded")
+	}
+	// Updating an existing pairing still works when the store is full.
+	if err := s.Put("controller-0", ltpk, true); err != nil {
+		t.Fatalf("update in full store: %v", err)
+	}
+}
+
+// A failed save must not leave the change live in memory.
+func TestPairingStoreRollsBackOnSaveFailure(t *testing.T) {
+	dir := t.TempDir()
+	s, err := loadPairingStore(filepath.Join(dir, "pairings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ltpk := make([]byte, 32)
+	if err := s.Put("kept", ltpk, true); err != nil {
+		t.Fatal(err)
+	}
+	// Point the store below a regular file so every save fails.
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.path = filepath.Join(blocker, "pairings.json")
+
+	if err := s.Put("new", ltpk, true); err == nil {
+		t.Fatal("Put succeeded despite save failure")
+	}
+	if _, ok, _ := s.Get("new"); ok {
+		t.Fatal("unsaved pairing is trusted in memory")
+	}
+	if err := s.Delete("kept"); err == nil {
+		t.Fatal("Delete succeeded despite save failure")
+	}
+	if _, ok, _ := s.Get("kept"); !ok {
+		t.Fatal("pairing vanished from memory although its removal was not saved")
+	}
+}

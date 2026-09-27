@@ -93,7 +93,20 @@ func (s *controlServer) handleConn(conn net.Conn) {
 		}
 	}()
 
+	// A connection must establish a session key within PairTimeout. Without
+	// this, MaxConnections idle clients sending cheap requests just inside
+	// ReadHeaderTimeout would hold every slot and lock real senders out.
+	var pairTimer *time.Timer
+	if cs.limits.PairTimeout > 0 {
+		pairTimer = time.AfterFunc(cs.limits.PairTimeout, func() { _ = conn.Close() })
+		defer pairTimer.Stop()
+	}
+
 	for {
+		if pairTimer != nil && len(cs.sessionKey) > 0 {
+			pairTimer.Stop()
+			pairTimer = nil
+		}
 		if cs.limits.ReadHeaderTimeout > 0 {
 			_ = conn.SetReadDeadline(time.Now().Add(cs.limits.ReadHeaderTimeout))
 		}
