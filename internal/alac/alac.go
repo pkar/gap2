@@ -385,13 +385,15 @@ func lpcPrediction(errorBuf, out []int32, bps int, coefs []int16, order, quant i
 
 	for i := order + 1; i < n; i++ {
 		d := out[i-order-1]
-		var val int64
+		// The reference encoder accumulates the prediction in wrapping 32-bit
+		// arithmetic; 24-bit stereo (bps 25) can exceed that range, so match
+		// it exactly rather than summing in 64 bits.
+		var acc uint32
 		for j := 0; j < order; j++ {
-			val += int64(out[i-order+j]-d) * int64(coefs[j])
+			acc += uint32(out[i-order+j]-d) * uint32(int32(coefs[j]))
 		}
-		val = (val + (1 << (quant - 1))) >> quant
-		val += int64(d) + int64(errorBuf[i])
-		out[i] = signExtend(int32(val), bps)
+		val := (int64(int32(acc)) + 1<<(quant-1)) >> quant
+		out[i] = signExtend(int32(val)+d+errorBuf[i], bps)
 
 		// Adapt the predictor coefficients.
 		errVal := int64(errorBuf[i])
