@@ -4,7 +4,6 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"errors"
-	"math/big"
 	"math/bits"
 )
 
@@ -85,79 +84,142 @@ func chacha20XOR(key, nonce []byte, counter uint32, dst, src []byte) {
 	}
 }
 
-// poly1305Tag computes the Poly1305 one-time authenticator for msg under the
-// 32-byte one-time key derived from a ChaCha20 block.
-func poly1305Tag(key []byte, msg []byte) [16]byte {
+// poly1305 is a constant-time Poly1305 accumulator using three 64-bit limbs
+// (RFC 8439 section 2.5). h is the accumulator; r and s are the clamped key
+// halves.
+type poly1305 struct {
+	h [3]uint64
+	r [2]uint64
+	s [2]uint64
+}
+
+func newPoly1305(key []byte) poly1305 {
 	if len(key) != 32 {
 		panic("hap: poly1305 key must be 32 bytes")
 	}
-
-	// Clamp the r half of the key.
-	rb := make([]byte, 16)
-	copy(rb, key[:16])
-	rb[3] &= 15
-	rb[7] &= 15
-	rb[11] &= 15
-	rb[15] &= 15
-	rb[4] &= 252
-	rb[8] &= 252
-	rb[12] &= 252
-
-	r := leInt(rb)
-	s := leInt(key[16:32])
-
-	// p = 2^130 - 5.
-	p := new(big.Int).Lsh(big.NewInt(1), 130)
-	p.Sub(p, big.NewInt(5))
-
-	acc := new(big.Int)
-	for i := 0; i < len(msg); i += 16 {
-		n := len(msg) - i
-		if n > 16 {
-			n = 16
-		}
-		block := make([]byte, n+1)
-		copy(block, msg[i:i+n])
-		block[n] = 1
-		acc.Add(acc, leInt(block))
-		acc.Mul(acc, r)
-		acc.Mod(acc, p)
+	return poly1305{
+		r: [2]uint64{
+			binary.LittleEndian.Uint64(key[0:8]) & 0x0FFFFFFC0FFFFFFF,
+			binary.LittleEndian.Uint64(key[8:16]) & 0x0FFFFFFC0FFFFFFC,
+		},
+		s: [2]uint64{
+			binary.LittleEndian.Uint64(key[16:24]),
+			binary.LittleEndian.Uint64(key[24:32]),
+		},
 	}
-	acc.Add(acc, s)
+}
 
-	mask := new(big.Int).Lsh(big.NewInt(1), 128)
-	mask.Sub(mask, big.NewInt(1))
-	acc.And(acc, mask)
+// block absorbs one 16-byte little-endian block plus the 2^128 marker bit
+// hibit (1 for a full block, 0 when the caller already appended the 0x01 pad).
+func (p *poly1305) block(b []byte, hibit uint64) {
+	h0, h1, h2 := p.h[0], p.h[1], p.h[2]
+	r0, r1 := p.r[0], p.r[1]
+	var c uint64
+	h0, c = bits.Add64(h0, binary.LittleEndian.Uint64(b[0:8]), 0)
+	h1, c = bits.Add64(h1, binary.LittleEndian.Uint64(b[8:16]), c)
+	h2 += c + hibit
 
+	// h * r. h2 stays below 8 and r is clamped, so no product term
+	// overflows 128 bits.
+	h0r0hi, h0r0lo := bits.Mul64(h0, r0)
+	h1r0hi, h1r0lo := bits.Mul64(h1, r0)
+	h2r0hi, h2r0lo := bits.Mul64(h2, r0)
+	h0r1hi, h0r1lo := bits.Mul64(h0, r1)
+	h1r1hi, h1r1lo := bits.Mul64(h1, r1)
+	h2r1hi, h2r1lo := bits.Mul64(h2, r1)
+
+	m1lo, c := bits.Add64(h1r0lo, h0r1lo, 0)
+	m1hi, _ := bits.Add64(h1r0hi, h0r1hi, c)
+	m2lo, c := bits.Add64(h2r0lo, h1r1lo, 0)
+	m2hi, _ := bits.Add64(h2r0hi, h1r1hi, c)
+
+	t0 := h0r0lo
+	t1, c := bits.Add64(m1lo, h0r0hi, 0)
+	t2, c := bits.Add64(m2lo, m1hi, c)
+	t3, _ := bits.Add64(h2r1lo, m2hi, c)
+	_ = h2r1hi // always zero: h2 < 8 and r1 < 2^60
+
+	// Reduce modulo 2^130-5: fold (t >> 130) * 5 back into the low 130 bits
+	// as (t >> 130) * 4 + (t >> 130).
+	h0, h1, h2 = t0, t1, t2&3
+	cLo, cHi := t2&^3, t3
+	h0, c = bits.Add64(h0, cLo, 0)
+	h1, c = bits.Add64(h1, cHi, c)
+	h2 += c
+	cLo, cHi = cLo>>2|cHi<<62, cHi>>2
+	h0, c = bits.Add64(h0, cLo, 0)
+	h1, c = bits.Add64(h1, cHi, c)
+	h2 += c
+	p.h[0], p.h[1], p.h[2] = h0, h1, h2
+}
+
+// write absorbs msg; a trailing partial block gets the RFC 8439 0x01 pad.
+func (p *poly1305) write(msg []byte) {
+	for len(msg) >= 16 {
+		p.block(msg[:16], 1)
+		msg = msg[16:]
+	}
+	if len(msg) > 0 {
+		var buf [16]byte
+		copy(buf[:], msg)
+		buf[len(msg)] = 1
+		p.block(buf[:], 0)
+	}
+}
+
+// writePadded absorbs msg zero-padded to a multiple of 16 bytes, as the AEAD
+// construction requires for the AAD and ciphertext.
+func (p *poly1305) writePadded(msg []byte) {
+	for len(msg) >= 16 {
+		p.block(msg[:16], 1)
+		msg = msg[16:]
+	}
+	if len(msg) > 0 {
+		var buf [16]byte
+		copy(buf[:], msg)
+		p.block(buf[:], 1)
+	}
+}
+
+func (p *poly1305) sum() [16]byte {
+	h0, h1, h2 := p.h[0], p.h[1], p.h[2]
+	// Constant-time select of h - p when h >= p = 2^130-5.
+	g0, b := bits.Sub64(h0, 0xFFFFFFFFFFFFFFFB, 0)
+	g1, b := bits.Sub64(h1, 0xFFFFFFFFFFFFFFFF, b)
+	_, b = bits.Sub64(h2, 3, b)
+	mask := b - 1 // all ones when there was no borrow (h >= p)
+	h0 = h0&^mask | g0&mask
+	h1 = h1&^mask | g1&mask
+
+	var c uint64
+	h0, c = bits.Add64(h0, p.s[0], 0)
+	h1, _ = bits.Add64(h1, p.s[1], c)
 	var tag [16]byte
-	b := acc.Bytes()
-	for i := 0; i < len(b); i++ {
-		tag[i] = b[len(b)-1-i]
-	}
+	binary.LittleEndian.PutUint64(tag[0:8], h0)
+	binary.LittleEndian.PutUint64(tag[8:16], h1)
 	return tag
 }
 
-func leInt(b []byte) *big.Int {
-	r := make([]byte, len(b))
-	for i := range b {
-		r[i] = b[len(b)-1-i]
-	}
-	return new(big.Int).SetBytes(r)
+// poly1305Tag computes the Poly1305 one-time authenticator for msg under the
+// 32-byte one-time key derived from a ChaCha20 block.
+func poly1305Tag(key []byte, msg []byte) [16]byte {
+	p := newPoly1305(key)
+	p.write(msg)
+	return p.sum()
 }
 
-// buildMacData assembles the Poly1305 input described by RFC 8439 section
-// 2.8: aad, padding, ciphertext, padding, and the two 64-bit lengths.
-func buildMacData(aad, ciphertext []byte) []byte {
-	pad := func(n int) int { return (16 - n%16) % 16 }
-	buf := make([]byte, 0, len(aad)+pad(len(aad))+len(ciphertext)+pad(len(ciphertext))+16)
-	buf = append(buf, aad...)
-	buf = append(buf, make([]byte, pad(len(aad)))...)
-	buf = append(buf, ciphertext...)
-	buf = append(buf, make([]byte, pad(len(ciphertext)))...)
+// aeadTag computes the RFC 8439 section 2.8 tag over aad, padding,
+// ciphertext, padding, and the two 64-bit lengths without assembling them in
+// a temporary buffer.
+func aeadTag(polyKey, aad, ciphertext []byte) [16]byte {
+	p := newPoly1305(polyKey)
+	p.writePadded(aad)
+	p.writePadded(ciphertext)
 	var lengths [16]byte
 	binary.LittleEndian.PutUint64(lengths[0:8], uint64(len(aad)))
 	binary.LittleEndian.PutUint64(lengths[8:16], uint64(len(ciphertext)))
-	return append(buf, lengths[:]...)
+	p.block(lengths[:], 1)
+	return p.sum()
 }
 
 // aeadSeal encrypts plaintext with a 12-byte nonce and returns
@@ -173,7 +235,7 @@ func aeadSeal(key, nonce, plaintext, aad []byte) []byte {
 	out := make([]byte, len(plaintext)+16)
 	chacha20XOR(key, nonce, 1, out[:len(plaintext)], plaintext)
 
-	mac := poly1305Tag(polyKey, buildMacData(aad, out[:len(plaintext)]))
+	mac := aeadTag(polyKey, aad, out[:len(plaintext)])
 	copy(out[len(plaintext):], mac[:])
 	return out
 }
@@ -181,10 +243,19 @@ func aeadSeal(key, nonce, plaintext, aad []byte) []byte {
 // aeadOpen decrypts ciphertext||tag and returns plaintext. It fails closed on
 // any authentication mismatch.
 func aeadOpen(key, nonce, ciphertext, aad []byte) ([]byte, error) {
+	if len(ciphertext) < 16 {
+		return nil, errAuth
+	}
+	return aeadOpenTo(make([]byte, len(ciphertext)-16), key, nonce, ciphertext, aad)
+}
+
+// aeadOpenTo is aeadOpen writing the plaintext into dst, which must be
+// len(ciphertext)-16 bytes. dst may alias the start of ciphertext exactly.
+func aeadOpenTo(dst, key, nonce, ciphertext, aad []byte) ([]byte, error) {
 	if len(nonce) != 12 {
 		panic("hap: AEAD nonce must be 12 bytes")
 	}
-	if len(ciphertext) < 16 {
+	if len(ciphertext) < 16 || len(dst) != len(ciphertext)-16 {
 		return nil, errAuth
 	}
 
@@ -195,14 +266,13 @@ func aeadOpen(key, nonce, ciphertext, aad []byte) ([]byte, error) {
 	body := ciphertext[:len(ciphertext)-16]
 	got := ciphertext[len(ciphertext)-16:]
 
-	expect := poly1305Tag(polyKey, buildMacData(aad, body))
+	expect := aeadTag(polyKey, aad, body)
 	if subtle.ConstantTimeCompare(got, expect[:]) != 1 {
 		return nil, errAuth
 	}
 
-	out := make([]byte, len(body))
-	chacha20XOR(key, nonce, 1, out, body)
-	return out, nil
+	chacha20XOR(key, nonce, 1, dst, body)
+	return dst, nil
 }
 
 // padNonce8 left-pads an 8-byte HAP nonce string with four zero bytes to form

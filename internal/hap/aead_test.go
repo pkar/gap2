@@ -3,6 +3,8 @@ package hap
 import (
 	"bytes"
 	"encoding/hex"
+	"math/big"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -107,5 +109,107 @@ func TestAEADOpenTampered(t *testing.T) {
 	sealed[0] ^= 1
 	if _, err := aeadOpen(key, nonce, sealed, []byte("aad")); err == nil {
 		t.Fatal("expected authentication failure for tampered ciphertext")
+	}
+}
+
+func BenchmarkAEADOpenAudioPacket(b *testing.B) {
+	key := make([]byte, 32)
+	nonce := make([]byte, 12)
+	aad := make([]byte, 8)
+	sealed := aeadSeal(key, nonce, make([]byte, 1408), aad)
+	b.SetBytes(int64(len(sealed)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := aeadOpen(key, nonce, sealed, aad); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// poly1305Reference is a direct big-integer transcription of RFC 8439
+// section 2.5, used to cross-check the limb implementation.
+func poly1305Reference(key, msg []byte) [16]byte {
+	le := func(b []byte) *big.Int {
+		r := make([]byte, len(b))
+		for i := range b {
+			r[i] = b[len(b)-1-i]
+		}
+		return new(big.Int).SetBytes(r)
+	}
+	rb := append([]byte(nil), key[:16]...)
+	for _, i := range []int{3, 7, 11, 15} {
+		rb[i] &= 15
+	}
+	for _, i := range []int{4, 8, 12} {
+		rb[i] &= 252
+	}
+	r, s := le(rb), le(key[16:32])
+	p := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 130), big.NewInt(5))
+	acc := new(big.Int)
+	for i := 0; i < len(msg); i += 16 {
+		n := min(16, len(msg)-i)
+		block := append(append([]byte(nil), msg[i:i+n]...), 1)
+		acc.Add(acc, le(block))
+		acc.Mul(acc, r)
+		acc.Mod(acc, p)
+	}
+	acc.Add(acc, s)
+	b := acc.Bytes()
+	var tag [16]byte
+	for i := 0; i < len(b) && i < 16; i++ {
+		tag[i] = b[len(b)-1-i]
+	}
+	return tag
+}
+
+// RFC 8439 appendix A.3 vectors 5-9 exercise the final h >= p reduction.
+func TestPoly1305EdgeVectors(t *testing.T) {
+	rep := func(b byte, n int) []byte { return bytes.Repeat([]byte{b}, n) }
+	key := func(r byte, s []byte) []byte {
+		k := make([]byte, 32)
+		k[0] = r
+		copy(k[16:], s)
+		return k
+	}
+	cat := func(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
+	for i, tc := range []struct {
+		key, msg []byte
+		tag      string
+	}{
+		{key(2, nil), rep(0xff, 16), "03000000000000000000000000000000"},
+		{key(2, rep(0xff, 16)), cat([]byte{2}, rep(0, 15)), "03000000000000000000000000000000"},
+		{key(1, nil), cat(rep(0xff, 16), rep(0xf0, 1), rep(0xff, 15), []byte{0x11}, rep(0, 15)), "05000000000000000000000000000000"},
+		{key(1, nil), cat(rep(0xff, 16), []byte{0xfb}, rep(0xfe, 15), rep(0x01, 16)), "00000000000000000000000000000000"},
+		{key(2, nil), cat([]byte{0xfd}, rep(0xff, 15)), "faffffffffffffffffffffffffffffff"},
+	} {
+		got := poly1305Tag(tc.key, tc.msg)
+		if hex.EncodeToString(got[:]) != tc.tag {
+			t.Errorf("vector %d: tag %x, want %s", i+5, got, tc.tag)
+		}
+	}
+}
+
+func TestPoly1305MatchesReference(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	fill := func(b []byte, mode int) {
+		for i := range b {
+			switch mode {
+			case 0:
+				b[i] = byte(rng.Uint32())
+			case 1:
+				b[i] = 0xff
+			default:
+				b[i] = 0
+			}
+		}
+	}
+	for i := 0; i < 3000; i++ {
+		key := make([]byte, 32)
+		msg := make([]byte, rng.IntN(200))
+		fill(key, i%3)
+		fill(msg, (i/3)%3)
+		if got, want := poly1305Tag(key, msg), poly1305Reference(key, msg); got != want {
+			t.Fatalf("case %d: tag %x, want %x (key %x msg %x)", i, got, want, key, msg)
+		}
 	}
 }

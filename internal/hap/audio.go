@@ -38,13 +38,13 @@ func (d *AudioDecryptor) OpenBuffered(packet []byte) ([]byte, error) {
 }
 
 func (d *AudioDecryptor) open(packet []byte) ([]byte, error) {
-	nonce := make([]byte, 12)
+	var nonce [12]byte
 	copy(nonce[4:], packet[len(packet)-8:])
-	plain, err := aeadOpen(d.key, nonce, packet[12:len(packet)-8], packet[4:12])
-	if err != nil {
+	sealed := packet[12 : len(packet)-8]
+	out := make([]byte, 12+len(sealed)-16)
+	if _, err := aeadOpenTo(out[12:], d.key, nonce[:], sealed, packet[4:12]); err != nil {
 		return nil, err
 	}
-	out := make([]byte, 12, 12+len(plain))
 	copy(out, packet[:12])
-	return append(out, plain...), nil
+	return out, nil
 }
