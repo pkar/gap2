@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"encoding/binary"
+	"errors"
 	"math/big"
 	"sync"
 	"testing"
@@ -309,6 +310,50 @@ func TestPairSetupWrongProof(t *testing.T) {
 	}
 	if !bytes.Contains(res.Response, []byte{ErrorAuthentication}) {
 		t.Fatalf("expected error response, got %x", res.Response)
+	}
+	// A retry against the same B must not be possible without a fresh M1.
+	if _, err := sess.Handle(m3); !errors.Is(err, ErrState) {
+		t.Fatalf("M3 retry without M1: err = %v, want ErrState", err)
+	}
+}
+
+// M5 must be refused unless M3 proved knowledge of the PIN. Before the fix, a
+// client could skip M3 (or fail it) and send an M5 sealed with a key derived
+// from an empty or attacker-chosen SRP secret, storing an admin pairing.
+func TestPairSetupM5RequiresVerifiedM3(t *testing.T) {
+	accID, _ := NewIdentity(repeatReader{0x07}, "accessory-id")
+	m1, _ := encodeTLV([]tlv8.Item{
+		{Type: TLVMethod, Value: []byte{MethodPairSetup}},
+		{Type: TLVState, Value: []byte{StateM1}},
+	})
+	badM3, _ := encodeTLV([]tlv8.Item{
+		{Type: TLVState, Value: []byte{StateM3}},
+		{Type: TLVPublicKey, Value: bytes.Repeat([]byte{0x01}, 64)},
+		{Type: TLVProof, Value: []byte{0xde, 0xad}},
+	})
+	encKey := hkdfSHA512(nil, []byte(pairSetupEncryptSalt), []byte(pairSetupEncryptInfo), 32)
+	m5, _ := encodeTLV([]tlv8.Item{
+		{Type: TLVState, Value: []byte{StateM5}},
+		{Type: TLVEncryptedData, Value: aeadSeal(encKey, padNonce8([]byte("PS-Msg05")), []byte{1, 1, 'x'}, nil)},
+	})
+
+	for name, steps := range map[string][][]byte{
+		"skip M3":   {m1},
+		"failed M3": {m1, badM3},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := newMemStore()
+			sess := NewPairSetupSession(repeatReader{0x05}, accID, "3939", store)
+			for _, msg := range steps {
+				_, _ = sess.Handle(msg)
+			}
+			if _, err := sess.Handle(m5); !errors.Is(err, ErrState) {
+				t.Fatalf("M5 err = %v, want ErrState", err)
+			}
+			if list, _ := store.List(); len(list) != 0 {
+				t.Fatalf("pairing stored without PIN: %v", list)
+			}
+		})
 	}
 }
 

@@ -43,6 +43,10 @@ type PairSetupSession struct {
 
 	srp       *srpServer
 	transient bool
+	// proofOK records that M3 verified the controller's SRP proof. M5 is
+	// only accepted after that; otherwise its key would derive from an
+	// unauthenticated (or wrong-PIN) SRP exchange.
+	proofOK bool
 }
 
 // NewPairSetupSession starts a Pair Setup exchange. pin is the numeric setup
@@ -95,6 +99,8 @@ func (s *PairSetupSession) handleM1(items []tlv8.Item) (PairSetupResult, error) 
 		}
 		s.transient = f&FlagTransient != 0
 	}
+	s.proofOK = false
+	s.srp = nil
 
 	srp, err := newSRPServer(s.rand, usernamePairSetup, s.pin)
 	if err != nil {
@@ -117,6 +123,9 @@ func (s *PairSetupSession) handleM3(items []tlv8.Item) (PairSetupResult, error) 
 	if s.srp == nil {
 		return PairSetupResult{}, fmt.Errorf("%w: no M1", ErrState)
 	}
+	if s.proofOK {
+		return PairSetupResult{}, fmt.Errorf("%w: M3 repeated", ErrState)
+	}
 	public, err := requireItem(items, TLVPublicKey)
 	if err != nil {
 		return PairSetupResult{}, err
@@ -130,6 +139,8 @@ func (s *PairSetupSession) handleM3(items []tlv8.Item) (PairSetupResult, error) 
 		return PairSetupResult{}, err
 	}
 	if !s.srp.verifyProof(proof) {
+		// Drop the SRP state so every PIN guess needs a fresh M1 and B.
+		s.srp = nil
 		resp, _ := encodeTLV([]tlv8.Item{
 			{Type: TLVState, Value: []byte{StateM4}},
 			{Type: TLVError, Value: []byte{ErrorAuthentication}},
@@ -137,6 +148,7 @@ func (s *PairSetupSession) handleM3(items []tlv8.Item) (PairSetupResult, error) 
 		return PairSetupResult{Response: resp}, fmt.Errorf("%w: bad SRP proof", ErrAuthentication)
 	}
 
+	s.proofOK = true
 	resp, err := encodeTLV([]tlv8.Item{
 		{Type: TLVState, Value: []byte{StateM4}},
 		{Type: TLVProof, Value: s.srp.proofBytes()},
@@ -157,8 +169,8 @@ func (s *PairSetupSession) handleM3(items []tlv8.Item) (PairSetupResult, error) 
 }
 
 func (s *PairSetupSession) handleM5(items []tlv8.Item) (PairSetupResult, error) {
-	if s.srp == nil {
-		return PairSetupResult{}, fmt.Errorf("%w: no M1", ErrState)
+	if s.srp == nil || !s.proofOK {
+		return PairSetupResult{}, fmt.Errorf("%w: M5 without verified M3", ErrState)
 	}
 	encrypted, err := requireItem(items, TLVEncryptedData)
 	if err != nil {
