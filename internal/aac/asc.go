@@ -130,6 +130,9 @@ func readSamplingFrequency(br *BitReader) (int, error) {
 		}
 		return int(rate), nil
 	}
+	if ascSampleRates[idx] == 0 { // indices 13 and 14 are reserved
+		return 0, ErrInvalidASC
+	}
 	return ascSampleRates[idx], nil
 }
 

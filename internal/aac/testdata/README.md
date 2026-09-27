@@ -15,7 +15,10 @@ ffmpeg -f lavfi -i 'anoisesrc=color=pink:sample_rate=44100:duration=0.4:seed=1' 
 ```
 
 Perceptual noise substitution is disabled for the broadband fixture because
-different decoders use different random noise sequences. Generate each
+different decoders use different random noise sequences. The tone fixture
+keeps the encoder default, so every frame carries a few high-frequency noise
+bands; its waveform SNR is lower than the others, and lowest in the final
+frames where the tone ends and noise bands dominate. Generate each
 reference PCM file with `ffmpeg -i NAME.aac -f s16le NAME.s16le`.
 Fixtures were generated with FFmpeg's Lavc63.1.101 encoder.
 
@@ -33,3 +36,21 @@ and `-aac_pce 1` (ADTS cannot carry configuration 12 directly). The test
 supplies configuration 12, as the buffered AP2 format does, and checks every
 interleaved channel against FFmpeg's output. Generate references with the
 same `ffmpeg -i NAME.aac -f s16le NAME.s16le` command above.
+
+The PNS fixture keeps perceptual noise substitution on, so tests compare its
+high-frequency energy rather than its waveform:
+
+```sh
+ffmpeg -f lavfi -i 'anoisesrc=color=white:amplitude=0.3:sample_rate=44100:duration=0.25:seed=1' \
+  -ac 2 -c:a aac -aac_pns 1 -b:a 48k -f adts pns-44100.aac
+```
+
+The intensity fixture's channels share a correlated high tone at a low bitrate,
+so the encoder emits intensity-stereo bands under `ms_mask_present == 2`:
+
+```sh
+ffmpeg -f lavfi -i 'aevalsrc=0.3*sin(2*PI*440*t)+0.2*sin(2*PI*9000*t)+0.1*random(0)|0.3*sin(2*PI*440*t)-0.1*sin(2*PI*9000*t)+0.05*random(0):s=44100:d=0.25' \
+  -c:a aac -aac_pns 0 -aac_is 1 -aac_ms 1 -b:a 40k -f adts intensity-44100.aac
+```
+
+These two fixtures were generated with FFmpeg 9.0.1.

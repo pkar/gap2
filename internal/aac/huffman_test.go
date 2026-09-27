@@ -124,3 +124,16 @@ func checkBands(t *testing.T, name string, idx int, offs []uint16, end uint16) {
 		}
 	}
 }
+
+func TestDecodeEscapeRange(t *testing.T) {
+	// N=8: eight ones, a zero, then 12 bits of all ones -> 4096+4095 = 8191.
+	r := NewBitReader(encodeBits(0x1fe<<12|0xfff, 9+12))
+	if v, err := decodeEscape(r); err != nil || v != 8191 {
+		t.Fatalf("N=8 escape = %d, %v; want 8191", v, err)
+	}
+	// N=9 exceeds the 13-bit escape limit.
+	r = NewBitReader(encodeBits(0x3fe<<13, 10+13))
+	if _, err := decodeEscape(r); err != ErrBadHuffman {
+		t.Fatalf("N=9 escape err = %v, want ErrBadHuffman", err)
+	}
+}

@@ -117,6 +117,10 @@ type Decoder struct {
 	prevWin  [8]int
 	order    []int
 	pnsState uint32
+
+	// Per-frame scratch, reused so Decode allocates only the output block.
+	pcm [8 * 1024]float64 // planar samples in bitstream element order
+	ch  [2]channelData
 }
 
 // NewDecoder returns a Decoder for an AudioSpecificConfig. Only AAC-LC with
@@ -173,7 +177,7 @@ func (d *Decoder) Decode(au []byte) (pcm.Block, error) {
 	if err != nil {
 		return pcm.Block{}, err
 	}
-	out := make([]float64, d.channels*1024)
+	out := d.pcm[:d.channels*1024]
 
 	r := NewBitReader(au)
 	slot := 0
@@ -187,7 +191,8 @@ func (d *Decoder) Decode(au []byte) (pcm.Block, error) {
 			if _, err := r.Read(4); err != nil { // element_instance_tag
 				return pcm.Block{}, ErrMalformed
 			}
-			cd := &channelData{}
+			cd := &d.ch[0]
+			*cd = channelData{}
 			if err := d.decodeChannelData(r, cd, false); err != nil {
 				return pcm.Block{}, err
 			}
@@ -234,24 +239,20 @@ func (d *Decoder) Decode(au []byte) (pcm.Block, error) {
 	return d.writeBlock(block, out)
 }
 
+// writeBlock converts planar float samples at integer-PCM scale, stored in
+// bitstream element order, into interleaved little-endian 16-bit PCM in
+// output speaker order. PCM sinks require frames interleaved as L,R,L,R
+// rather than a whole L block then R.
 func (d *Decoder) writeBlock(block pcm.Block, out []float64) (pcm.Block, error) {
-	ordered := make([]float64, len(out))
+	channels := len(d.order)
 	for dst, src := range d.order {
-		copy(ordered[dst*1024:(dst+1)*1024], out[src*1024:(src+1)*1024])
-	}
-	return writeBlock(block, ordered)
-}
-
-// writeBlock converts float samples at integer-PCM scale into interleaved
-// little-endian 16-bit PCM.
-func writeBlock(block pcm.Block, out []float64) (pcm.Block, error) {
-	for i := range out {
-		// The filterbank writes planar channels; PCM sinks require frames
-		// interleaved as L,R,L,R rather than a whole L block then R.
-		v := out[(i%block.Format.Channels)*1024+i/block.Format.Channels]
-		s := floatToInt16(v)
-		block.Data[2*i] = byte(s)
-		block.Data[2*i+1] = byte(s >> 8)
+		plane := out[src*1024 : (src+1)*1024]
+		for i, v := range plane {
+			s := floatToInt16(v)
+			o := 2 * (i*channels + dst)
+			block.Data[o] = byte(s)
+			block.Data[o+1] = byte(s >> 8)
+		}
 	}
 	return block, nil
 }
@@ -285,7 +286,14 @@ func (d *Decoder) decodePair(r *BitReader, leftSlot int, out []float64) error {
 			return ErrMalformed
 		}
 		msMask = int(v)
-		if msMask == 1 {
+		switch msMask {
+		case 2: // M/S on in every band; intensity bands read it as ms_used too
+			for g := range msUsed {
+				for sfb := range msUsed[g] {
+					msUsed[g][sfb] = true
+				}
+			}
+		case 1:
 			for g := 0; g < shared.numWindowGroups; g++ {
 				for sfb := 0; sfb < shared.maxSfb; sfb++ {
 					bit, err := r.ReadBit()
@@ -295,9 +303,12 @@ func (d *Decoder) decodePair(r *BitReader, leftSlot int, out []float64) error {
 					msUsed[g][sfb] = bit
 				}
 			}
+		case 3: // reserved
+			return ErrMalformed
 		}
 	}
-	left, right := &channelData{}, &channelData{}
+	left, right := &d.ch[0], &d.ch[1]
+	*left, *right = channelData{}, channelData{}
 	if common {
 		left.info = shared
 		right.info = shared
@@ -313,9 +324,9 @@ func (d *Decoder) decodePair(r *BitReader, leftSlot int, out []float64) error {
 	d.applyPNS(left)
 	d.applyPNS(right)
 	if common && msMask != 0 {
-		applyMS(left, right, msMask, &msUsed)
+		applyMS(left, right, &msUsed)
 	}
-	applyIntensity(left, right, msMask, &msUsed)
+	applyIntensity(left, right, &msUsed)
 	d.finishChannel(left, leftSlot, out)
 	d.finishChannel(right, leftSlot+1, out)
 	return nil
@@ -481,10 +492,10 @@ func (d *Decoder) sectionData(r *BitReader, cd *channelData) bool {
 					break
 				}
 			}
-			if length == 0 {
+			if length == 0 || k+length > info.maxSfb {
 				return false
 			}
-			for i := 0; i < length && k < info.maxSfb; i++ {
+			for i := 0; i < length; i++ {
 				cd.sfbCb[g][k] = cb
 				k++
 			}
@@ -512,7 +523,7 @@ func (d *Decoder) scaleFactorData(r *BitReader, cd *channelData) bool {
 					return false
 				}
 				isPos += delta
-				cd.sf[g][sfb] = isPos
+				cd.sf[g][sfb] = clamp(isPos, -155, 100)
 			case cb == noiseHCB:
 				if firstNoise {
 					firstNoise = false
@@ -528,7 +539,7 @@ func (d *Decoder) scaleFactorData(r *BitReader, cd *channelData) bool {
 					}
 					noiseEnergy += delta
 				}
-				cd.sf[g][sfb] = noiseEnergy
+				cd.sf[g][sfb] = clamp(noiseEnergy, -100, 155)
 			default:
 				delta, err := decodeScalefactor(r)
 				if err != nil {
@@ -543,6 +554,12 @@ func (d *Decoder) scaleFactorData(r *BitReader, cd *channelData) bool {
 		}
 	}
 	return true
+}
+
+// clamp bounds DPCM-accumulated intensity and noise positions to the range
+// reference decoders accept, keeping the derived gains finite.
+func clamp(v, lo, hi int) int {
+	return min(max(v, lo), hi)
 }
 
 // parsePulse reads pulse_data.
@@ -692,8 +709,10 @@ func applyPulse(cd *channelData) {
 
 func isIntensity(cb uint8) bool { return cb == intensityHCB || cb == intensityHCB2 }
 
-// applyPNS fills perceptual-noise-substitution bands with scaled random
-// values at the coded energy.
+// applyPNS fills perceptual-noise-substitution bands with random values
+// normalized so each window's band carries energy 2^(noise_nrg/2)
+// (ISO/IEC 14496-3 4.6.13.3). NOISE_OFFSET is already folded into the
+// decoded energy, so unlike regular scalefactors no sfOffset applies.
 func (d *Decoder) applyPNS(cd *channelData) {
 	info := &cd.info
 	gs := groupStarts(info)
@@ -702,12 +721,22 @@ func (d *Decoder) applyPNS(cd *channelData) {
 			if cd.sfbCb[g][sfb] != noiseHCB {
 				continue
 			}
-			scale := math.Exp2(0.25 * float64(cd.sf[g][sfb]-sfOffset))
+			gain := math.Exp2(0.25 * float64(cd.sf[g][sfb]))
 			start, end := int(info.swb[sfb]), int(info.swb[sfb+1])
 			for w := 0; w < info.windowGroupLen[g]; w++ {
-				base := (gs[g] + w) * 128
-				for k := start; k < end; k++ {
-					cd.spec[base+k] = d.pnsNext() * scale
+				band := cd.spec[(gs[g]+w)*128+start : (gs[g]+w)*128+end]
+				energy := 0.0
+				for k := range band {
+					v := d.pnsNext()
+					band[k] = v
+					energy += v * v
+				}
+				if energy == 0 {
+					continue
+				}
+				scale := gain / math.Sqrt(energy)
+				for k := range band {
+					band[k] *= scale
 				}
 			}
 		}
@@ -724,13 +753,12 @@ func (d *Decoder) pnsNext() float64 {
 
 // applyMS reverses M/S stereo per scalefactor band, skipping intensity and
 // noise bands.
-func applyMS(left, right *channelData, msMask int, msUsed *[maxWindowGroups][maxSFBCount]bool) {
+func applyMS(left, right *channelData, msUsed *[maxWindowGroups][maxSFBCount]bool) {
 	info := &left.info
 	gs := groupStarts(info)
 	for g := 0; g < info.numWindowGroups; g++ {
 		for sfb := 0; sfb < info.maxSfb; sfb++ {
-			on := msMask == 2 || (msMask == 1 && msUsed[g][sfb])
-			if !on || left.sfbCb[g][sfb] >= noiseHCB || right.sfbCb[g][sfb] >= noiseHCB {
+			if !msUsed[g][sfb] || left.sfbCb[g][sfb] >= noiseHCB || right.sfbCb[g][sfb] >= noiseHCB {
 				continue
 			}
 			start, end := int(info.swb[sfb]), int(info.swb[sfb+1])
@@ -747,8 +775,10 @@ func applyMS(left, right *channelData, msMask int, msUsed *[maxWindowGroups][max
 }
 
 // applyIntensity fills the right channel's intensity bands by scaling the
-// left channel's coefficients.
-func applyIntensity(left, right *channelData, msMask int, msUsed *[maxWindowGroups][maxSFBCount]bool) {
+// left channel's coefficients. ms_used inverts the sign, including when
+// ms_mask_present == 2 sets it for every band; FFmpeg's decoder does the same
+// and its encoder emits intensity bands under that mask.
+func applyIntensity(left, right *channelData, msUsed *[maxWindowGroups][maxSFBCount]bool) {
 	info := &right.info
 	gs := groupStarts(info)
 	for g := 0; g < info.numWindowGroups; g++ {
@@ -761,7 +791,7 @@ func applyIntensity(left, right *channelData, msMask int, msUsed *[maxWindowGrou
 			if cb == intensityHCB2 {
 				scale = -scale
 			}
-			if msMask == 1 && msUsed[g][sfb] {
+			if msUsed[g][sfb] {
 				scale = -scale
 			}
 			start, end := int(info.swb[sfb]), int(info.swb[sfb+1])

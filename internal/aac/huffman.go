@@ -137,7 +137,8 @@ func decodeSpectral(r *BitReader, cb int, out []int) error {
 }
 
 // decodeEscape reads codebook 11's escape word: N leading ones, a zero, then
-// N+4 magnitude bits, giving 2^(N+4) + word.
+// N+4 magnitude bits, giving 2^(N+4) + word. The escape is at most 13 bits
+// (N <= 8), so magnitudes never exceed 8191 (ISO/IEC 14496-3 4.6.3.3).
 func decodeEscape(r *BitReader) (int, error) {
 	n := 0
 	for {
@@ -149,7 +150,7 @@ func decodeEscape(r *BitReader) (int, error) {
 			break
 		}
 		n++
-		if n > 24 {
+		if n > 8 {
 			return 0, ErrBadHuffman
 		}
 	}

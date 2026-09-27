@@ -135,3 +135,30 @@ func TestNewDecoderRejects(t *testing.T) {
 		t.Fatal("expected error for unsupported sample rate")
 	}
 }
+
+// A section that runs past max_sfb is a bitstream error, not something to
+// truncate silently.
+func TestDecodeSectionOverrun(t *testing.T) {
+	d, err := NewDecoder(ASC{ObjectType: 2, SamplingFrequency: 44100, ChannelConfiguration: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var w bitWriter
+	w.put(0, 3)   // SCE
+	w.put(0, 4)   // element_instance_tag
+	w.put(100, 8) // global_gain
+	w.put(0, 1)   // ics_reserved_bit
+	w.put(0, 2)   // only_long_sequence
+	w.put(0, 1)   // window_shape
+	w.put(1, 6)   // max_sfb = 1
+	w.put(0, 1)   // predictor_data_present
+	w.put(0, 4)   // codebook 0
+	w.put(2, 5)   // section length 2 > max_sfb
+	w.put(0, 1)   // pulse_data_present
+	w.put(0, 1)   // tns_data_present
+	w.put(0, 1)   // gain_control_data_present
+	w.put(elEND, 3)
+	if _, err := d.Decode(w.bytes()); err != ErrMalformed {
+		t.Fatalf("err = %v, want ErrMalformed", err)
+	}
+}

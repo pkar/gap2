@@ -25,7 +25,8 @@ func TestParseASCAACLC(t *testing.T) {
 }
 
 func TestParseASCErrors(t *testing.T) {
-	for _, data := range [][]byte{nil, {0x12}} {
+	// 0x16 0x90: AAC-LC with reserved sampling index 13, stereo.
+	for _, data := range [][]byte{nil, {0x12}, {0x16, 0x90}} {
 		if _, err := ParseASC(data); err == nil {
 			t.Fatalf("ParseASC(%x) succeeded, want error", data)
 		}
