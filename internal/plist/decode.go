@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 	"unicode/utf16"
+	"unsafe"
 )
 
 var appleEpoch = time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -43,6 +44,11 @@ type binaryDecoder struct {
 	numObjects    uint64
 	limits        Limits
 	objectsRead   int
+	// budget is the remaining number of decoded bytes. Objects are decoded
+	// again for every reference, so without it a small input whose
+	// containers repeatedly reference one large data object would expand to
+	// gigabytes.
+	budget uint64
 }
 
 func decodeBinary(data []byte, limits Limits) (*Value, error) {
@@ -78,6 +84,7 @@ func decodeBinary(data []byte, limits Limits) (*Value, error) {
 		offsetIntSize: offsetIntSize,
 		numObjects:    numObjects,
 		limits:        limits,
+		budget:        2 * uint64(limits.MaxBytes),
 	}
 	for i := uint64(0); i < numObjects; i++ {
 		off := readUint(data, offsetTable+i*uint64(offsetIntSize), offsetIntSize)
@@ -120,7 +127,9 @@ func (d *binaryDecoder) readObject(ref uint64, depth int) (*Value, error) {
 		case 0x9:
 			return &Value{Kind: KindBool, Bool: true}, nil
 		case 0xF:
-			return nil, nil // fill object; not reachable via top object normally
+			// Fill bytes are padding, never a referenced object. Returning
+			// (nil, nil) here used to let a top-level fill crash callers.
+			return nil, ErrMalformed
 		default:
 			return nil, ErrMalformed
 		}
@@ -165,6 +174,9 @@ func (d *binaryDecoder) readObject(ref uint64, depth int) (*Value, error) {
 		if err := d.check(valPos, n); err != nil {
 			return nil, err
 		}
+		if err := d.charge(n); err != nil {
+			return nil, err
+		}
 		b := append([]byte(nil), d.data[valPos:valPos+n]...)
 		return &Value{Kind: KindData, Data: b}, nil
 	case 0x5: // ASCII string
@@ -176,6 +188,9 @@ func (d *binaryDecoder) readObject(ref uint64, depth int) (*Value, error) {
 			return nil, ErrTooLarge
 		}
 		if err := d.check(valPos, n); err != nil {
+			return nil, err
+		}
+		if err := d.charge(n); err != nil {
 			return nil, err
 		}
 		s := string(d.data[valPos : valPos+n])
@@ -191,16 +206,17 @@ func (d *binaryDecoder) readObject(ref uint64, depth int) (*Value, error) {
 		if err := d.check(valPos, n); err != nil {
 			return nil, err
 		}
+		if err := d.charge(n); err != nil {
+			return nil, err
+		}
 		units := make([]uint16, n/2)
 		for i := range units {
 			units[i] = binary.BigEndian.Uint16(d.data[valPos+uint64(i)*2 : valPos+uint64(i)*2+2])
 		}
 		return &Value{Kind: KindString, String: string(utf16.Decode(units))}, nil
 	case 0x8: // UID
-		n, valPos, err := d.readLength(pos, info)
-		if err != nil {
-			return nil, err
-		}
+		// The low nibble is the byte count minus one.
+		n, valPos := uint64(info)+1, pos
 		if n > 8 {
 			return nil, ErrMalformed
 		}
@@ -217,6 +233,9 @@ func (d *binaryDecoder) readObject(ref uint64, depth int) (*Value, error) {
 			return nil, ErrTooManyObjects
 		}
 		if err := d.check(refsPos, n*uint64(d.objRefSize)); err != nil {
+			return nil, err
+		}
+		if err := d.charge(n * valueSize); err != nil {
 			return nil, err
 		}
 		arr := make([]Value, n)
@@ -242,6 +261,9 @@ func (d *binaryDecoder) readObject(ref uint64, depth int) (*Value, error) {
 		}
 		refBytes := n * uint64(d.objRefSize)
 		if err := d.check(refsPos, refBytes*2); err != nil {
+			return nil, err
+		}
+		if err := d.charge(n * valueSize); err != nil {
 			return nil, err
 		}
 		keys := make([]uint64, n)
@@ -279,6 +301,18 @@ func (d *binaryDecoder) readObject(ref uint64, depth int) (*Value, error) {
 	default:
 		return nil, ErrMalformed
 	}
+}
+
+// valueSize approximates the storage one decoded array or dict element needs.
+const valueSize = uint64(unsafe.Sizeof(Value{}))
+
+// charge deducts n decoded bytes from the budget.
+func (d *binaryDecoder) charge(n uint64) error {
+	if n > d.budget {
+		return ErrTooLarge
+	}
+	d.budget -= n
+	return nil
 }
 
 func (d *binaryDecoder) check(pos, n uint64) error {

@@ -241,3 +241,75 @@ func assertValueEqual(t *testing.T, got, want *Value) {
 		}
 	}
 }
+
+// buildBinary assembles a binary plist from raw object encodings, using
+// 4-byte offsets and 2-byte object references. Object 0 is the top object.
+func buildBinary(objects ...[]byte) []byte {
+	out := []byte("bplist00")
+	offsets := make([]uint32, len(objects))
+	for i, o := range objects {
+		offsets[i] = uint32(len(out))
+		out = append(out, o...)
+	}
+	table := len(out)
+	for _, off := range offsets {
+		out = binary.BigEndian.AppendUint32(out, off)
+	}
+	out = append(out, 0, 0, 0, 0, 0, 0, 4, 2)
+	out = binary.BigEndian.AppendUint64(out, uint64(len(objects)))
+	out = binary.BigEndian.AppendUint64(out, 0)
+	return binary.BigEndian.AppendUint64(out, uint64(table))
+}
+
+// A fill byte as the top object used to decode to (nil, nil), which callers
+// dereferenced.
+func TestDecodeBinaryTopLevelFill(t *testing.T) {
+	v, err := Decode(buildBinary([]byte{0x0F}), DefaultLimits())
+	if v != nil || !errors.Is(err, ErrMalformed) {
+		t.Fatalf("Decode = %v, %v; want nil, ErrMalformed", v, err)
+	}
+}
+
+// An array whose entries all reference one large data object must not
+// expand to many copies of it.
+func TestDecodeBinaryReferenceAmplification(t *testing.T) {
+	const refs, size = 5000, 64 << 10
+	arr := []byte{0xAF, 0x11}
+	arr = binary.BigEndian.AppendUint16(arr, refs)
+	for range refs {
+		arr = binary.BigEndian.AppendUint16(arr, 1)
+	}
+	data := []byte{0x4F, 0x12}
+	data = binary.BigEndian.AppendUint32(data, size)
+	data = append(data, make([]byte, size)...)
+
+	input := buildBinary(arr, data)
+	if _, err := Decode(input, DefaultLimits()); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("Decode of %d-byte input expanding to %d MiB: err = %v, want ErrTooLarge",
+			len(input), refs*size>>20, err)
+	}
+
+	// Modest sharing, as Apple's encoder does for repeated strings, still works.
+	small := []byte{0xA4, 0, 1, 0, 1, 0, 1, 0, 1}
+	v, err := Decode(buildBinary(small, []byte{0x52, 'h', 'i'}), DefaultLimits())
+	if err != nil || len(v.Array) != 4 || v.Array[3].String != "hi" {
+		t.Fatalf("shared refs: %v, %v", v, err)
+	}
+}
+
+// A UID marker 0x8n carries n+1 bytes.
+func TestDecodeBinaryUIDLength(t *testing.T) {
+	for _, tc := range []struct {
+		obj  []byte
+		want int64
+	}{
+		{[]byte{0x80, 0x2A}, 0x2A},
+		{[]byte{0x81, 0x01, 0x02}, 0x0102},
+		{[]byte{0x83, 0x01, 0x02, 0x03, 0x04}, 0x01020304},
+	} {
+		v, err := Decode(buildBinary(tc.obj), DefaultLimits())
+		if err != nil || v.Int != tc.want {
+			t.Fatalf("UID %x = %v, %v; want %d", tc.obj, v, err, tc.want)
+		}
+	}
+}
