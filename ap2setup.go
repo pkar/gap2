@@ -2,6 +2,7 @@ package airplay2
 
 import (
 	"errors"
+	"time"
 
 	"github.com/pkar/gap2/internal/plist"
 )
@@ -11,6 +12,11 @@ const (
 	ap2StreamRealtime = 96  // realtime audio over UDP RTP
 	ap2StreamBuffered = 103 // buffered audio over TCP
 )
+
+// ap2AnchorWait bounds how long a buffered stream's first packets wait for
+// the sender's playback anchor. Senders anchor well under a second after the
+// first packet.
+const ap2AnchorWait = 2 * time.Second
 
 // errNotAp2Setup reports a SETUP body that is not an AirPlay 2 plist (for
 // example the empty body of an AirPlay 1 Transport-header SETUP).

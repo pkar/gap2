@@ -474,6 +474,12 @@ func (h *mediaHandler) openNativeStream(entry *plist.Value) error {
 	if h.clock != nil {
 		h.playout = playout.NewSynced(h.gain, h.clock.FrameLocalTime, ptp.MonotonicNanos)
 		h.playout.SetOffset(h.cfg.OutputOffset)
+		if integer("type", 0) == ap2StreamBuffered {
+			// A buffered sender sends the first packets before the anchor
+			// that schedules them; hold them for it instead of playing the
+			// opening unscheduled.
+			h.playout.SetAnchorWait(ap2AnchorWait)
+		}
 		out = h.playout
 	}
 	sess, err := media.NewSession("ap2", m, out)

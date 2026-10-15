@@ -275,6 +275,67 @@ func TestHeldStaleBlockDoesNotStallResume(t *testing.T) {
 	}
 }
 
+// A stream's first packets arrive before its anchor. With an anchor wait they
+// are held, then scheduled by the anchor instead of played unscheduled.
+func TestUnanchoredBlockWaitsForAnchor(t *testing.T) {
+	rs := &recordingSink{}
+	var anchorSet atomic.Bool
+	// The anchor puts the first frame 5ms in the past: an untimed sink starts
+	// on time by trimming it.
+	s := NewSynced(rs, func(uint32) (uint64, bool) {
+		return uint64(time.Second), anchorSet.Load()
+	}, func() uint64 { return uint64(time.Second + 5*time.Millisecond) })
+	s.SetAnchorWait(time.Minute)
+	format := pcm.Format{Rate: 48000, Channels: 2, Format: pcm.S16LE}
+	block, err := pcm.NewBlock(format, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.WriteTimed(context.Background(), 0, block) }()
+	time.Sleep(30 * time.Millisecond)
+	if frames, _, _ := rs.snapshot(); frames != 0 {
+		t.Fatalf("unanchored block was written early: %d frames", frames)
+	}
+	anchorSet.Store(true)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("block did not play after the anchor arrived")
+	}
+	if frames, _, _ := rs.snapshot(); frames != 1024-240 {
+		t.Fatalf("frames = %d, want %d", frames, 1024-240)
+	}
+}
+
+// A sender that never anchors still plays once the wait expires, and later
+// blocks do not wait again.
+func TestUnanchoredBlocksPlayAfterAnchorWait(t *testing.T) {
+	rs := &recordingSink{}
+	s := NewSynced(rs, func(uint32) (uint64, bool) { return 0, false }, func() uint64 { return 0 })
+	s.SetAnchorWait(40 * time.Millisecond)
+	start := time.Now()
+	if err := s.WriteTimed(context.Background(), 0, syncedBlock()); err != nil {
+		t.Fatal(err)
+	}
+	if waited := time.Since(start); waited < 40*time.Millisecond {
+		t.Fatalf("first unanchored block waited %v, want at least 40ms", waited)
+	}
+	start = time.Now()
+	if err := s.WriteTimed(context.Background(), 1, syncedBlock()); err != nil {
+		t.Fatal(err)
+	}
+	if waited := time.Since(start); waited > 20*time.Millisecond {
+		t.Fatalf("second unanchored block waited %v after the wait expired", waited)
+	}
+	if frames, _, _ := rs.snapshot(); frames != 4 {
+		t.Fatalf("frames = %d, want 4", frames)
+	}
+}
+
 func TestFlushDiscardsHeldBlock(t *testing.T) {
 	rs := &recordingSink{}
 	s := NewSynced(rs, func(uint32) (uint64, bool) { return 0, true }, func() uint64 { return 0 })

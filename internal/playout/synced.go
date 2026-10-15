@@ -25,6 +25,10 @@ const alignTolerance = 2 * time.Millisecond
 // across a track change. Waiting for it would silence the stream.
 const maxAhead = 10 * time.Second
 
+// syncedEpoch is the reference for anchor-wait timestamps, which use the real
+// monotonic clock rather than the injected one.
+var syncedEpoch = time.Now()
+
 // Synced writes PCM blocks to an underlying sink at the presentation times
 // mapped from their RTP timestamps. It is the PTP-synchronized scheduling
 // layer: mapFrame converts a source frame timestamp into a local monotonic
@@ -33,7 +37,9 @@ const maxAhead = 10 * time.Second
 //
 // A frame with no mapped deadline (for example before a playback anchor and
 // clock offset are established) is written immediately, so audio still flows
-// even while synchronization is being acquired.
+// even while synchronization is being acquired. SetAnchorWait holds such
+// blocks for a while instead, for senders that always follow their first
+// packets with an anchor.
 //
 // While paused, blocks wait rather than being discarded. A sender resumes or
 // starts a new track by sending its first packets before the anchor that
@@ -48,14 +54,38 @@ type Synced struct {
 	padded     atomic.Int64
 	trimmed    atomic.Int64
 	skew       atomic.Int64
-	sink       pcm.Sink
-	mapFrame   func(frame uint32) (uint64, bool)
-	now        func() uint64
+
+	anchorWait   atomic.Int64 // how long unmapped blocks wait for a deadline
+	unmappedFrom atomic.Int64 // start of the current unmapped spell, ns since syncedEpoch plus one; 0 when mapped
+
+	sink     pcm.Sink
+	mapFrame func(frame uint32) (uint64, bool)
+	now      func() uint64
 }
 
 // SetOffset shifts presentation deadlines. Positive values play later;
 // negative values compensate for latency downstream of the PCM device.
 func (s *Synced) SetOffset(offset time.Duration) { s.offset.Store(int64(offset)) }
+
+// SetAnchorWait makes blocks with no mapped deadline wait up to d for one
+// instead of being written immediately. A stream's first packets arrive
+// before the anchor that schedules them; writing them unscheduled plays the
+// opening early and then starves the output until the scheduled audio is due.
+// The wait is measured from the first unmapped block, and once it expires
+// unmapped blocks are written immediately until a deadline is mapped again,
+// so a sender that never anchors still plays. Zero disables the wait.
+func (s *Synced) SetAnchorWait(d time.Duration) { s.anchorWait.Store(int64(d)) }
+
+// awaitAnchor reports whether an unmapped block should keep waiting.
+func (s *Synced) awaitAnchor() bool {
+	wait := s.anchorWait.Load()
+	if wait <= 0 {
+		return false
+	}
+	now := int64(time.Since(syncedEpoch)) + 1
+	s.unmappedFrom.CompareAndSwap(0, now)
+	return now-s.unmappedFrom.Load() < wait
+}
 
 // Correction reports cumulative inserted/removed time and the last observed
 // difference between the presentation deadline and the hardware queue tail.
@@ -128,36 +158,18 @@ func (s *Synced) WriteTimed(ctx context.Context, frame uint32, block pcm.Block) 
 
 // wait returns when block's write time arrives, when a flush discards it
 // (generation changes), or with ctx's error. While paused it keeps waiting:
-// the anchor that schedules the block may not have arrived yet. It reports
-// stale when the block's deadline is more than maxAhead away.
+// the anchor that schedules the block may not have arrived yet. An unmapped
+// block waits while awaitAnchor allows. It reports stale when the block's
+// deadline is more than maxAhead away.
 func (s *Synced) wait(ctx context.Context, frame uint32, generation uint64) (stale bool, err error) {
 	for generation == s.generation.Load() {
 		delay := sleepChunk
 		if !s.paused.Load() {
-			deadline, ok := s.deadline(frame)
-			if !ok {
-				return false, nil
+			var ready bool
+			delay, ready, stale = s.remaining(frame)
+			if ready || stale {
+				return stale, nil
 			}
-			if int64(deadline)-int64(s.now()) > int64(maxAhead) {
-				return true, nil
-			}
-			// A hardware sink must receive samples before their presentation
-			// deadline so the DMA queue can absorb scheduler and network
-			// jitter. File sinks have no playback clock and retain exact
-			// capture timing.
-			if s.sink.Position().Timed {
-				const lead = uint64(100 * time.Millisecond)
-				if deadline > lead {
-					deadline -= lead
-				} else {
-					deadline = 0
-				}
-			}
-			remain := int64(deadline) - int64(s.now())
-			if remain <= 0 {
-				return false, nil
-			}
-			delay = min(time.Duration(remain), sleepChunk)
 		}
 		timer := time.NewTimer(delay)
 		select {
@@ -170,6 +182,35 @@ func (s *Synced) wait(ctx context.Context, frame uint32, generation uint64) (sta
 		// Recompute its deadline instead of sleeping against a stale epoch.
 	}
 	return false, nil
+}
+
+// remaining returns how long to sleep before checking frame again, whether its
+// write time has arrived, and whether its deadline is implausibly far ahead.
+func (s *Synced) remaining(frame uint32) (delay time.Duration, ready, stale bool) {
+	deadline, ok := s.deadline(frame)
+	if !ok {
+		return sleepChunk, !s.awaitAnchor(), false
+	}
+	s.unmappedFrom.Store(0)
+	if int64(deadline)-int64(s.now()) > int64(maxAhead) {
+		return 0, false, true
+	}
+	// A hardware sink must receive samples before their presentation
+	// deadline so the DMA queue can absorb scheduler and network jitter.
+	// File sinks have no playback clock and retain exact capture timing.
+	if s.sink.Position().Timed {
+		const lead = uint64(100 * time.Millisecond)
+		if deadline > lead {
+			deadline -= lead
+		} else {
+			deadline = 0
+		}
+	}
+	remain := int64(deadline) - int64(s.now())
+	if remain <= 0 {
+		return 0, true, false
+	}
+	return min(time.Duration(remain), sleepChunk), false, false
 }
 
 // align pads or trims block so it plays at its deadline. It is called with mu
