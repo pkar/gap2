@@ -147,7 +147,7 @@ func TestSyncedWaitsForDeadline(t *testing.T) {
 func TestSyncedCancellation(t *testing.T) {
 	rs := &recordingSink{}
 	s := NewSynced(rs,
-		func(uint32) (uint64, bool) { return 1 << 62, true },
+		func(uint32) (uint64, bool) { return uint64(5 * time.Second), true },
 		func() uint64 { return 0 },
 	)
 
@@ -172,7 +172,7 @@ func TestSyncedCancellation(t *testing.T) {
 
 func TestPauseDiscardsWaitingBlock(t *testing.T) {
 	rs := &recordingSink{}
-	s := NewSynced(rs, func(uint32) (uint64, bool) { return 1 << 62, true }, func() uint64 { return 0 })
+	s := NewSynced(rs, func(uint32) (uint64, bool) { return uint64(5 * time.Second), true }, func() uint64 { return 0 })
 	done := make(chan error, 1)
 	go func() { done <- s.WriteTimed(context.Background(), 0, syncedBlock()) }()
 	time.Sleep(20 * time.Millisecond)
@@ -227,6 +227,51 @@ func TestPauseHoldsNewBlockUntilResume(t *testing.T) {
 	}
 	if frames, _, _ := rs.snapshot(); frames != 2 {
 		t.Fatalf("frames after resume = %d, want 2", frames)
+	}
+}
+
+// A packet left over from the previous track can be held through a track
+// change and then mapped by the new anchor to a deadline hours away. It must
+// be discarded instead of silencing the stream, and the next track's audio
+// must still play.
+func TestHeldStaleBlockDoesNotStallResume(t *testing.T) {
+	rs := &recordingSink{}
+	var anchorSet atomic.Bool
+	s := NewSynced(rs, func(frame uint32) (uint64, bool) {
+		if !anchorSet.Load() {
+			return 0, false
+		}
+		if frame == 1 { // previous track's epoch under the new anchor
+			return uint64(5 * time.Hour), true
+		}
+		return uint64(time.Second), true
+	}, func() uint64 { return uint64(time.Second) })
+	if err := s.SetPaused(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.WriteTimed(context.Background(), 1, syncedBlock()) }()
+	time.Sleep(20 * time.Millisecond)
+	anchorSet.Store(true)
+	if err := s.SetPaused(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale block stalled playback after resume")
+	}
+	if frames, _, _ := rs.snapshot(); frames != 0 {
+		t.Fatal("stale block was played")
+	}
+	if err := s.WriteTimed(context.Background(), 2, syncedBlock()); err != nil {
+		t.Fatal(err)
+	}
+	if frames, _, _ := rs.snapshot(); frames != 2 {
+		t.Fatalf("frames after stale block = %d, want 2", frames)
 	}
 }
 
@@ -323,7 +368,7 @@ func TestSyncedStartsUntimedSinkOnTime(t *testing.T) {
 func TestSyncedRecomputesChangedAnchor(t *testing.T) {
 	rs := &recordingSink{}
 	var deadline atomic.Uint64
-	deadline.Store(1 << 62)
+	deadline.Store(uint64(5 * time.Second))
 	s := NewSynced(rs, func(uint32) (uint64, bool) { return deadline.Load(), true }, func() uint64 { return 0 })
 	done := make(chan error, 1)
 	go func() { done <- s.WriteTimed(context.Background(), 0, syncedBlock()) }()

@@ -17,6 +17,14 @@ const sleepChunk = 10 * time.Millisecond
 // position quantization and timer slack instead of chasing every observation.
 const alignTolerance = 2 * time.Millisecond
 
+// maxAhead bounds how far in the future a block's deadline may be. Blocks are
+// handled in order, so the next block is normally due within a fraction of a
+// second, and a new anchor schedules its first frame shortly after it
+// arrives. A deadline much further out comes from a packet of an earlier RTP
+// epoch that a flush did not remove, such as the previous track's tail held
+// across a track change. Waiting for it would silence the stream.
+const maxAhead = 10 * time.Second
+
 // Synced writes PCM blocks to an underlying sink at the presentation times
 // mapped from their RTP timestamps. It is the PTP-synchronized scheduling
 // layer: mapFrame converts a source frame timestamp into a local monotonic
@@ -89,8 +97,13 @@ func NewSynced(sink pcm.Sink, mapFrame func(frame uint32) (uint64, bool), now fu
 func (s *Synced) WriteTimed(ctx context.Context, frame uint32, block pcm.Block) error {
 	generation := s.generation.Load()
 	for {
-		if err := s.wait(ctx, frame, generation); err != nil {
+		stale, err := s.wait(ctx, frame, generation)
+		if err != nil {
 			return err
+		}
+		if stale {
+			s.trimmed.Add(int64(block.Duration()))
+			return nil
 		}
 		s.mu.Lock()
 		if generation != s.generation.Load() {
@@ -115,14 +128,18 @@ func (s *Synced) WriteTimed(ctx context.Context, frame uint32, block pcm.Block) 
 
 // wait returns when block's write time arrives, when a flush discards it
 // (generation changes), or with ctx's error. While paused it keeps waiting:
-// the anchor that schedules the block may not have arrived yet.
-func (s *Synced) wait(ctx context.Context, frame uint32, generation uint64) error {
+// the anchor that schedules the block may not have arrived yet. It reports
+// stale when the block's deadline is more than maxAhead away.
+func (s *Synced) wait(ctx context.Context, frame uint32, generation uint64) (stale bool, err error) {
 	for generation == s.generation.Load() {
 		delay := sleepChunk
 		if !s.paused.Load() {
 			deadline, ok := s.deadline(frame)
 			if !ok {
-				return nil
+				return false, nil
+			}
+			if int64(deadline)-int64(s.now()) > int64(maxAhead) {
+				return true, nil
 			}
 			// A hardware sink must receive samples before their presentation
 			// deadline so the DMA queue can absorb scheduler and network
@@ -138,7 +155,7 @@ func (s *Synced) wait(ctx context.Context, frame uint32, generation uint64) erro
 			}
 			remain := int64(deadline) - int64(s.now())
 			if remain <= 0 {
-				return nil
+				return false, nil
 			}
 			delay = min(time.Duration(remain), sleepChunk)
 		}
@@ -146,13 +163,13 @@ func (s *Synced) wait(ctx context.Context, frame uint32, generation uint64) erro
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return ctx.Err()
+			return false, ctx.Err()
 		case <-timer.C:
 		}
 		// Seek/reconnect can replace the anchor while this packet waits.
 		// Recompute its deadline instead of sleeping against a stale epoch.
 	}
-	return nil
+	return false, nil
 }
 
 // align pads or trims block so it plays at its deadline. It is called with mu
