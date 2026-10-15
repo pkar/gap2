@@ -192,6 +192,134 @@ func TestPauseDiscardsWaitingBlock(t *testing.T) {
 	}
 }
 
+// A track change pauses, flushes, then sends the new track's first packets
+// before the anchor that resumes playback. Those packets must wait for the
+// anchor instead of being dropped, or the new track starts late.
+func TestPauseHoldsNewBlockUntilResume(t *testing.T) {
+	rs := &recordingSink{}
+	var now atomic.Uint64
+	s := NewSynced(rs, func(uint32) (uint64, bool) { return uint64(time.Second), true }, func() uint64 { return now.Load() })
+	if err := s.SetPaused(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.WriteTimed(context.Background(), 0, syncedBlock()) }()
+	time.Sleep(30 * time.Millisecond)
+	if frames, _, _ := rs.snapshot(); frames != 0 {
+		t.Fatal("audio played while paused")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("paused block returned early: %v", err)
+	default:
+	}
+	now.Store(uint64(time.Second)) // the resume anchor makes the block due
+	if err := s.SetPaused(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("held block was not written after resume")
+	}
+	if frames, _, _ := rs.snapshot(); frames != 2 {
+		t.Fatalf("frames after resume = %d, want 2", frames)
+	}
+}
+
+func TestFlushDiscardsHeldBlock(t *testing.T) {
+	rs := &recordingSink{}
+	s := NewSynced(rs, func(uint32) (uint64, bool) { return 0, true }, func() uint64 { return 0 })
+	if err := s.SetPaused(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.WriteTimed(context.Background(), 0, syncedBlock()) }()
+	time.Sleep(20 * time.Millisecond)
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPaused(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("flushed block remained held")
+	}
+	if frames, _, _ := rs.snapshot(); frames != 0 {
+		t.Fatal("flushed audio played")
+	}
+}
+
+func TestPausedBlockObservesCancellation(t *testing.T) {
+	s := NewSynced(&recordingSink{}, func(uint32) (uint64, bool) { return 0, true }, func() uint64 { return 0 })
+	if err := s.SetPaused(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.WriteTimed(ctx, 0, syncedBlock()) }()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err != context.Canceled {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("paused block ignored cancellation")
+	}
+}
+
+// A sink without a playback clock plays blocks back to back, so a late first
+// block would keep the whole stream late. Only that first block after a flush
+// is trimmed; later blocks keep the established schedule.
+func TestSyncedStartsUntimedSinkOnTime(t *testing.T) {
+	format := pcm.Format{Rate: 48000, Channels: 2, Format: pcm.S16LE}
+	block := func(frames int) pcm.Block {
+		b, err := pcm.NewBlock(format, frames)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	rs := &recordingSink{}
+	// Every block is due at 1s; the clock reads 1.01s, so each is 10ms late.
+	s := NewSynced(rs, func(uint32) (uint64, bool) { return uint64(time.Second), true }, func() uint64 { return uint64(1010 * time.Millisecond) })
+	ctx := context.Background()
+	write := func(frames int) int64 {
+		t.Helper()
+		before, _, _ := rs.snapshot()
+		if err := s.WriteTimed(ctx, 0, block(frames)); err != nil {
+			t.Fatal(err)
+		}
+		after, _, _ := rs.snapshot()
+		return after - before
+	}
+	if got := write(240); got != 0 {
+		t.Fatalf("expired first block wrote %d frames, want 0", got)
+	}
+	if got := write(1024); got != 1024-480 {
+		t.Fatalf("late first block wrote %d frames, want %d", got, 1024-480)
+	}
+	if got := write(1024); got != 1024 {
+		t.Fatalf("block after start wrote %d frames, want 1024", got)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := write(1024); got != 1024-480 {
+		t.Fatalf("late first block after flush wrote %d frames, want %d", got, 1024-480)
+	}
+}
+
 func TestSyncedRecomputesChangedAnchor(t *testing.T) {
 	rs := &recordingSink{}
 	var deadline atomic.Uint64
