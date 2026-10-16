@@ -176,6 +176,9 @@ func (r *Receiver) Events() <-chan Event {
 // is best-effort: when multicast is unavailable the receiver still plays audio
 // but cannot synchronize its clock, which is logged rather than failing Run.
 func (r *Receiver) startPTP(ctx context.Context) {
+	r.ptpClock.SetMasterChangeHandler(func(e ptp.MasterChange) {
+		r.log.Info("PTP grandmaster changed", "from", fmt.Sprintf("%x", e.From), "to", fmt.Sprintf("%x", e.To), "anchorCarried", e.Carried)
+	})
 	group, err := ptp.ListenGroup(r.cfg.Interfaces, r.ptpClock)
 	if err != nil {
 		r.log.Warn("PTP listener unavailable", "err", err)

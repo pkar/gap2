@@ -37,6 +37,42 @@ type Clock struct {
 	// whether a usable anchor (positive rate) has been recorded.
 	anchor    Anchor
 	anchorSet bool
+	// carried reports that the anchor survived a grandmaster change and is
+	// held in local monotonic time: carriedNs is the local time at which
+	// anchor.Frame plays. The sender's timeline does not move when the group
+	// elects a new grandmaster, so the frames keep their local presentation
+	// times until the new master's offset settles and the anchor is rebased
+	// onto it.
+	carried   bool
+	carriedNs uint64
+
+	// onMasterChange, when set, is called after a grandmaster change.
+	onMasterChange func(MasterChange)
+}
+
+// rebaseSamples is how many Follow_Up samples from a new grandmaster the
+// offset average takes before a carried anchor moves onto it. The first
+// sample is a single one-way measurement; rebasing on it would keep its
+// network delay as a permanent playback offset. At Apple's 125 ms Sync
+// interval this is two seconds, during which the local clock drifts by
+// microseconds.
+const rebaseSamples = 16
+
+// MasterChange describes a switch from one grandmaster to another.
+type MasterChange struct {
+	From, To [8]byte
+	// Carried reports that the playback anchor is kept in local time until
+	// the new grandmaster's offset settles.
+	Carried bool
+}
+
+// SetMasterChangeHandler registers f to be called, outside the clock's lock,
+// after each change from one grandmaster to another. It is not called for
+// the first grandmaster.
+func (c *Clock) SetMasterChangeHandler(f func(MasterChange)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onMasterChange = f
 }
 
 type syncKey struct {
@@ -87,27 +123,43 @@ func NewClock() *Clock { return &Clock{} }
 // HandleAnnounce records the grandmaster identity from an Announce message.
 // The clock identity is taken from the grandmasterIdentity field carried in
 // the Announce body (m.Grandmaster). The offset is reset if the grandmaster
-// changes, because the new master's epoch may differ. A genuine change from
-// one master to another also clears the playback anchor, whose
-// RTP-frame-to-grandmaster-time mapping refers to the old master's epoch and
-// is meaningless for the new one; the zero-to-first-master transition keeps
-// any anchor already recorded, since there is no prior epoch for it to be
-// stale against.
+// changes, because the new master's epoch may differ.
+//
+// A change from one master to another happens mid-stream when speakers join
+// or leave the group. The playback anchor maps RTP frames to the old
+// master's epoch, but the frames' real presentation times do not change, and
+// the sender does not re-anchor until playback is paused, seeked, or moves
+// to another track. The anchor is therefore carried in local time and
+// rebased onto the new master once its offset settles (see HandleFollowUp).
+// Without a valid offset there is no local time to carry, and the anchor is
+// cleared. The zero-to-first-master transition keeps any anchor already
+// recorded, since there is no prior epoch for it to be stale against.
 func (c *Clock) HandleAnnounce(m Message) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if m.Grandmaster == c.masterID {
+		c.mu.Unlock()
 		return
 	}
-	changed := c.masterID != [8]byte{}
+	from := c.masterID
+	changed := from != [8]byte{}
+	if changed && c.anchorSet && !c.carried {
+		if c.valid {
+			c.carriedNs = uint64(int64(c.anchor.MasterNs) - c.offsetNs)
+			c.carried = true
+		} else {
+			c.anchorSet = false
+		}
+	}
 	c.masterID = m.Grandmaster
 	c.sourceID = m.Header.ClockID
 	c.syncs = nil
 	c.offsetNs = 0
 	c.valid = false
 	c.samples = 0
-	if changed {
-		c.anchorSet = false
+	notify, event := c.onMasterChange, MasterChange{From: from, To: m.Grandmaster, Carried: c.anchorSet && c.carried}
+	c.mu.Unlock()
+	if changed && notify != nil {
+		notify(event)
 	}
 }
 
@@ -154,11 +206,19 @@ func (c *Clock) HandleFollowUp(m Message, localNs uint64) {
 	if !c.valid {
 		c.offsetNs = raw
 		c.valid = true
-		return
+	} else {
+		// Average against the estimate, not the previous raw sample.
+		// Integrating asymmetrically weighted sample differences makes
+		// ordinary jitter drift.
+		c.offsetNs += (raw - c.offsetNs) / 8
 	}
-	// Average against the estimate, not the previous raw sample. Integrating
-	// asymmetrically weighted sample differences makes ordinary jitter drift.
-	c.offsetNs += (raw - c.offsetNs) / 8
+	if c.carried && c.samples >= rebaseSamples {
+		// Move the carried anchor onto the new master: the same frame, the
+		// same local presentation time, expressed in the new epoch.
+		c.anchor.MasterNs = uint64(int64(c.carriedNs) + c.offsetNs)
+		c.anchor.ClockID = c.masterID
+		c.carried = false
+	}
 }
 
 // Info returns a snapshot of the clock state.
@@ -214,6 +274,7 @@ func (c *Clock) SetAnchor(a Anchor) {
 	}
 	c.anchor = a
 	c.anchorSet = true
+	c.carried = false
 }
 
 // ClearAnchor starts a new RTP timestamp epoch while retaining PTP sync.
@@ -221,6 +282,7 @@ func (c *Clock) ClearAnchor() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.anchorSet = false
+	c.carried = false
 }
 
 // ChangeRate preserves the transition frame's presentation time when a
@@ -231,16 +293,34 @@ func (c *Clock) ChangeRate(frame uint32, rate int) {
 	if !c.anchorSet || rate <= 0 || rate == c.anchor.Rate {
 		return
 	}
-	ns, ok := c.anchor.MasterTime(frame)
-	if !ok {
-		return
+	if c.carried {
+		ns, ok := c.carriedAnchor().MasterTime(frame)
+		if !ok {
+			return
+		}
+		c.carriedNs = ns
+		c.anchor.MasterNs, _ = c.anchor.MasterTime(frame)
+	} else {
+		ns, ok := c.anchor.MasterTime(frame)
+		if !ok {
+			return
+		}
+		c.anchor.MasterNs = ns
 	}
 	c.anchor.Frame = frame
-	c.anchor.MasterNs = ns
 	c.anchor.Rate = rate
 }
 
+// carriedAnchor is the carried anchor with its time in the local clock.
+func (c *Clock) carriedAnchor() Anchor {
+	a := c.anchor
+	a.MasterNs = c.carriedNs
+	return a
+}
+
 // Anchor returns the most recent playback anchor and whether one is set.
+// While an anchor is carried across a grandmaster change, MasterNs still
+// refers to the previous grandmaster's epoch.
 func (c *Clock) Anchor() (Anchor, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -251,10 +331,14 @@ func (c *Clock) Anchor() (Anchor, bool) {
 // the RTP frame with timestamp frame should be presented. It combines the
 // playback anchor (RTP timestamp -> grandmaster time) with the offset estimate
 // (grandmaster time -> local time), and returns ok=false when either the
-// anchor or the offset estimate is unavailable.
+// anchor or the offset estimate is unavailable. An anchor carried across a
+// grandmaster change is already in local time and needs no offset.
 func (c *Clock) FrameLocalTime(frame uint32) (uint64, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.anchorSet && c.carried {
+		return c.carriedAnchor().LocalTime(frame, 0)
+	}
 	if !c.anchorSet || !c.valid {
 		return 0, false
 	}

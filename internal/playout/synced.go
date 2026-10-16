@@ -39,7 +39,9 @@ var syncedEpoch = time.Now()
 // clock offset are established) is written immediately, so audio still flows
 // even while synchronization is being acquired. SetAnchorWait holds such
 // blocks for a while instead, for senders that always follow their first
-// packets with an anchor.
+// packets with an anchor. Once a block has played since the last flush,
+// unmapped blocks are always written immediately so the output keeps its
+// established schedule.
 //
 // While paused, blocks wait rather than being discarded. A sender resumes or
 // starts a new track by sending its first packets before the anchor that
@@ -47,7 +49,7 @@ var syncedEpoch = time.Now()
 // discards held blocks.
 type Synced struct {
 	mu         sync.Mutex
-	started    bool // the sink has received a block since the last flush; guarded by mu
+	started    atomic.Bool // the sink has received a block since the last flush; written under mu
 	paused     atomic.Bool
 	generation atomic.Uint64
 	offset     atomic.Int64
@@ -74,6 +76,11 @@ func (s *Synced) SetOffset(offset time.Duration) { s.offset.Store(int64(offset))
 // The wait is measured from the first unmapped block, and once it expires
 // unmapped blocks are written immediately until a deadline is mapped again,
 // so a sender that never anchors still plays. Zero disables the wait.
+//
+// The wait applies only before the first block after a flush. A deadline that
+// disappears mid-stream (the anchor was dropped) is not the start of a
+// stream: holding blocks then would drain the output and leave the rest of
+// the stream playing late by the length of the wait.
 func (s *Synced) SetAnchorWait(d time.Duration) { s.anchorWait.Store(int64(d)) }
 
 // awaitAnchor reports whether an unmapped block should keep waiting.
@@ -152,7 +159,7 @@ func (s *Synced) WriteTimed(ctx context.Context, frame uint32, block pcm.Block) 
 	if err := s.sink.Write(ctx, block); err != nil {
 		return err
 	}
-	s.started = true
+	s.started.Store(true)
 	return nil
 }
 
@@ -189,6 +196,11 @@ func (s *Synced) wait(ctx context.Context, frame uint32, generation uint64) (sta
 func (s *Synced) remaining(frame uint32) (delay time.Duration, ready, stale bool) {
 	deadline, ok := s.deadline(frame)
 	if !ok {
+		if s.started.Load() {
+			// Keep feeding the output; it plays these frames right after
+			// the ones already queued, on the schedule set so far.
+			return 0, true, false
+		}
 		return sleepChunk, !s.awaitAnchor(), false
 	}
 	s.unmappedFrom.Store(0)
@@ -229,7 +241,7 @@ func (s *Synced) align(ctx context.Context, frame uint32, block *pcm.Block) erro
 		// passed (for example, an anchor that arrives after its presentation
 		// time), drop the late audio so the stream starts on time instead of
 		// staying behind. Later blocks keep the established schedule.
-		if s.started {
+		if s.started.Load() {
 			return nil
 		}
 		if late := int64(s.now()) - int64(due); late > tolerance {
@@ -287,7 +299,7 @@ func (s *Synced) Flush(ctx context.Context) error {
 	s.generation.Add(1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.started = false
+	s.started.Store(false)
 	return s.sink.Flush(ctx)
 }
 

@@ -336,6 +336,39 @@ func TestUnanchoredBlocksPlayAfterAnchorWait(t *testing.T) {
 	}
 }
 
+// An anchor dropped mid-stream must not hold blocks for the anchor wait:
+// that would drain the output and leave the rest of the stream late. After a
+// flush the next stream waits for its anchor again.
+func TestAnchorLostMidStreamKeepsPlaying(t *testing.T) {
+	rs := &recordingSink{}
+	var anchored atomic.Bool
+	anchored.Store(true)
+	s := NewSynced(rs, func(uint32) (uint64, bool) { return 0, anchored.Load() }, func() uint64 { return 0 })
+	s.SetAnchorWait(time.Minute)
+	ctx := context.Background()
+	if err := s.WriteTimed(ctx, 0, syncedBlock()); err != nil {
+		t.Fatal(err)
+	}
+	anchored.Store(false)
+	write := func() error {
+		wctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		defer cancel()
+		return s.WriteTimed(wctx, 2, syncedBlock())
+	}
+	if err := write(); err != nil {
+		t.Fatal("block held after the anchor was lost mid-stream:", err)
+	}
+	if frames, _, _ := rs.snapshot(); frames != 4 {
+		t.Fatalf("frames = %d, want 4", frames)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := write(); err != context.DeadlineExceeded {
+		t.Fatalf("unanchored first block after flush: err = %v, want it held", err)
+	}
+}
+
 func TestFlushDiscardsHeldBlock(t *testing.T) {
 	rs := &recordingSink{}
 	s := NewSynced(rs, func(uint32) (uint64, bool) { return 0, true }, func() uint64 { return 0 })
