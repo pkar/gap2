@@ -46,8 +46,60 @@ type Clock struct {
 	carried   bool
 	carriedNs uint64
 
+	// stepCount counts consecutive Follow_Up samples that disagree with the
+	// offset by more than stepThreshold and agree with each other; stepRaw is
+	// the latest of them.
+	stepCount int
+	stepRaw   int64
+
 	// onMasterChange, when set, is called after a grandmaster change.
 	onMasterChange func(MasterChange)
+	// onStep, when set, is called after the offset steps.
+	onStep func(Step)
+	// onSourceChange, when set, is called when Sync is taken from a
+	// different clock for the same grandmaster.
+	onSourceChange func(SourceChange)
+}
+
+// stepThreshold is how far a Follow_Up sample may disagree with the offset
+// before it is treated as a jump in the source's time rather than network
+// delay. Wi-Fi delay spikes reach tens of milliseconds, rarely more.
+const stepThreshold int64 = 250_000_000
+
+// stepConfirm is how many consecutive, mutually consistent samples beyond
+// stepThreshold step the offset: half a second at Apple's 125 ms Sync
+// interval. A smaller run is a delay spike and is ignored. Averaging toward
+// a jump instead would take about 15 seconds per hour of difference to
+// settle, and every block scheduled meanwhile plays at the wrong time or is
+// dropped as late.
+const stepConfirm = 4
+
+// Step describes a jump of the offset to a new source time base.
+type Step struct {
+	Source       [8]byte
+	FromNs, ToNs int64
+}
+
+// SourceChange describes a switch of the clock whose Sync messages drive the
+// offset, without a change of grandmaster.
+type SourceChange struct {
+	From, To [8]byte
+}
+
+// SetStepHandler registers f to be called, outside the clock's lock, after
+// the offset steps to a new source time base.
+func (c *Clock) SetStepHandler(f func(Step)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onStep = f
+}
+
+// SetSourceChangeHandler registers f to be called, outside the clock's lock,
+// when the clock switches to the grandmaster's own Sync messages.
+func (c *Clock) SetSourceChangeHandler(f func(SourceChange)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onSourceChange = f
 }
 
 // rebaseSamples is how many Follow_Up samples from a new grandmaster the
@@ -134,10 +186,30 @@ func NewClock() *Clock { return &Clock{} }
 // Without a valid offset there is no local time to carry, and the anchor is
 // cleared. The zero-to-first-master transition keeps any anchor already
 // recorded, since there is no prior epoch for it to be stale against.
+//
+// Other members of an AirPlay group relay the grandmaster's time and announce
+// it as their grandmaster too. The first Announce heard selects its sender
+// as the Sync source, but the grandmaster's own Sync is preferred as soon as
+// it announces: a relaying speaker can send Sync in another time base while
+// it joins or leaves the grandmaster's timeline.
 func (c *Clock) HandleAnnounce(m Message) {
 	c.mu.Lock()
 	if m.Grandmaster == c.masterID {
+		var notify func(SourceChange)
+		event := SourceChange{From: c.sourceID, To: m.Header.ClockID}
+		if m.Header.ClockID == m.Grandmaster && c.sourceID != m.Grandmaster {
+			// Keep the offset: a relay that tracks the grandmaster agrees
+			// within a millisecond or so, and a stepped one is caught by
+			// the step check on the next samples.
+			c.sourceID = m.Header.ClockID
+			c.syncs = nil
+			c.stepCount = 0
+			notify = c.onSourceChange
+		}
 		c.mu.Unlock()
+		if notify != nil {
+			notify(event)
+		}
 		return
 	}
 	from := c.masterID
@@ -156,6 +228,7 @@ func (c *Clock) HandleAnnounce(m Message) {
 	c.offsetNs = 0
 	c.valid = false
 	c.samples = 0
+	c.stepCount = 0
 	notify, event := c.onMasterChange, MasterChange{From: from, To: m.Grandmaster, Carried: c.anchorSet && c.carried}
 	c.mu.Unlock()
 	if changed && notify != nil {
@@ -185,12 +258,21 @@ func (c *Clock) HandleSync(m Message, localNs uint64) {
 //	offset = preciseOriginTimestamp + correction - localNs
 //
 // and it is smoothed with an exponential moving average. The first sample is
-// adopted directly.
+// adopted directly. A sample more than stepThreshold away is ignored as a
+// delay spike unless stepConfirm consecutive samples agree, which steps the
+// offset to the source's new time base.
 func (c *Clock) HandleFollowUp(m Message, localNs uint64) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	step, notify := c.followUp(m, localNs)
+	c.mu.Unlock()
+	if step != nil && notify != nil {
+		notify(*step)
+	}
+}
+
+func (c *Clock) followUp(m Message, localNs uint64) (*Step, func(Step)) {
 	if c.sourceID != [8]byte{} && m.Header.ClockID != c.sourceID {
-		return
+		return nil, nil
 	}
 	correction := m.Header.CorrectionNs
 	if sample, ok := c.syncs[keyFor(m.Header)]; ok {
@@ -200,6 +282,21 @@ func (c *Clock) HandleFollowUp(m Message, localNs uint64) {
 	}
 
 	raw := int64(m.Precise.AsNanos()) + correction - int64(localNs)
+	var step *Step
+	if c.valid && abs(raw-c.offsetNs) > stepThreshold {
+		if c.stepCount > 0 && abs(raw-c.stepRaw) <= stepThreshold {
+			c.stepCount++
+		} else {
+			c.stepCount = 1
+		}
+		c.stepRaw = raw
+		if c.stepCount < stepConfirm {
+			return nil, nil
+		}
+		step = &Step{Source: c.sourceID, FromNs: c.offsetNs, ToNs: raw}
+		c.valid = false // adopt raw below
+	}
+	c.stepCount = 0
 	c.localNs = localNs
 	c.samples++
 
@@ -219,6 +316,14 @@ func (c *Clock) HandleFollowUp(m Message, localNs uint64) {
 		c.anchor.ClockID = c.masterID
 		c.carried = false
 	}
+	return step, c.onStep
+}
+
+func abs(n int64) int64 {
+	if n < 0 {
+		return -n
+	}
+	return n
 }
 
 // Info returns a snapshot of the clock state.

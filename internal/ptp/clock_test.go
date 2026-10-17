@@ -150,6 +150,86 @@ func TestGrandmasterFlapKeepsCarriedAnchor(t *testing.T) {
 	}
 }
 
+// A source whose time jumps (for example a relay rejoining the grandmaster's
+// timeline) must move the offset at once instead of averaging toward the new
+// time base for many seconds, during which every block plays at the wrong time.
+func TestClockStepsToNewTimeBase(t *testing.T) {
+	c := NewClock()
+	var steps []Step
+	c.SetStepHandler(func(s Step) { steps = append(steps, s) })
+	c.HandleAnnounce(Message{Grandmaster: [8]byte{1}})
+	local := followUp(c, 100_000_000_000, 50_000_000_000_000, 8) // 50,000 s ahead
+	c.SetAnchor(Anchor{Frame: 0, MasterNs: 50_101_000_000_000, Rate: 48000})
+	if due, _ := c.FrameLocalTime(0); due != 101_000_000_000 {
+		t.Fatalf("due before step = %d", due)
+	}
+	local = followUp(c, local, 5_000_000_000, stepConfirm-1)
+	if offset, _ := c.Offset(); offset != 50_000_000_000_000 {
+		t.Fatalf("offset moved before the jump was confirmed: %d", offset)
+	}
+	followUp(c, local, 5_000_000_000, 1)
+	if offset, _ := c.Offset(); offset != 5_000_000_000 {
+		t.Fatalf("offset after step = %d, want 5s", offset)
+	}
+	if len(steps) != 1 || steps[0].FromNs != 50_000_000_000_000 || steps[0].ToNs != 5_000_000_000 {
+		t.Fatalf("steps = %+v", steps)
+	}
+}
+
+// Delay spikes shorter than stepConfirm samples must neither step nor pull
+// the average.
+func TestClockIgnoresDelaySpikes(t *testing.T) {
+	c := NewClock()
+	c.SetStepHandler(func(s Step) { t.Fatalf("stepped on a delay spike: %+v", s) })
+	local := followUp(c, 100_000_000_000, 1_000_000_000, 8)
+	for range 20 {
+		local = followUp(c, local, 1_000_000_000-400_000_000, stepConfirm-1) // 400 ms late
+		local = followUp(c, local, 1_000_000_000, 1)
+	}
+	if offset, _ := c.Offset(); offset != 1_000_000_000 {
+		t.Fatalf("delay spikes moved the offset to %d", offset)
+	}
+}
+
+// The first Announce may come from a group member relaying the grandmaster.
+// Once the grandmaster announces, its own Sync drives the offset.
+func TestClockPrefersGrandmasterSync(t *testing.T) {
+	c := NewClock()
+	gm, relay := [8]byte{1}, [8]byte{2}
+	var changes []SourceChange
+	c.SetSourceChangeHandler(func(e SourceChange) { changes = append(changes, e) })
+	sample := func(from [8]byte, local uint64, offset int64) {
+		master := uint64(int64(local) + offset)
+		h := Header{ClockID: from}
+		c.HandleFollowUp(Message{Header: h, Precise: Timestamp{Seconds: master / 1_000_000_000, Nanos: uint32(master % 1_000_000_000)}}, local)
+	}
+	c.HandleAnnounce(Message{Header: Header{ClockID: relay}, Grandmaster: gm})
+	sample(relay, 100_000_000_000, 7_000_000_000)
+	sample(gm, 100_000_000_000, 3_000_000_000)
+	if offset, _ := c.Offset(); offset != 7_000_000_000 {
+		t.Fatalf("offset = %d, want the relay's until the grandmaster announces", offset)
+	}
+	c.HandleAnnounce(Message{Header: Header{ClockID: relay}, Grandmaster: gm})
+	if len(changes) != 0 {
+		t.Fatalf("relay announce changed the source: %+v", changes)
+	}
+	c.HandleAnnounce(Message{Header: Header{ClockID: gm}, Grandmaster: gm})
+	if len(changes) != 1 || changes[0] != (SourceChange{From: relay, To: gm}) {
+		t.Fatalf("source changes = %+v", changes)
+	}
+	for i := range uint64(stepConfirm) {
+		sample(relay, 101_000_000_000+i, 7_000_000_000)
+		sample(gm, 101_000_000_000+i, 3_000_000_000)
+	}
+	if offset, _ := c.Offset(); offset != 3_000_000_000 {
+		t.Fatalf("offset = %d, want the grandmaster's", offset)
+	}
+	c.HandleAnnounce(Message{Header: Header{ClockID: gm}, Grandmaster: gm})
+	if len(changes) != 1 {
+		t.Fatalf("repeated grandmaster announce changed the source again: %+v", changes)
+	}
+}
+
 func TestChangeRateWhileCarried(t *testing.T) {
 	c := NewClock()
 	c.HandleAnnounce(Message{Grandmaster: [8]byte{1}})

@@ -179,6 +179,12 @@ func (r *Receiver) startPTP(ctx context.Context) {
 	r.ptpClock.SetMasterChangeHandler(func(e ptp.MasterChange) {
 		r.log.Info("PTP grandmaster changed", "from", fmt.Sprintf("%x", e.From), "to", fmt.Sprintf("%x", e.To), "anchorCarried", e.Carried)
 	})
+	r.ptpClock.SetSourceChangeHandler(func(e ptp.SourceChange) {
+		r.log.Info("PTP sync source changed to the grandmaster", "from", fmt.Sprintf("%x", e.From), "to", fmt.Sprintf("%x", e.To))
+	})
+	r.ptpClock.SetStepHandler(func(e ptp.Step) {
+		r.log.Info("PTP clock stepped", "source", fmt.Sprintf("%x", e.Source), "stepMs", (e.ToNs-e.FromNs)/1_000_000)
+	})
 	group, err := ptp.ListenGroup(r.cfg.Interfaces, r.ptpClock)
 	if err != nil {
 		r.log.Warn("PTP listener unavailable", "err", err)
