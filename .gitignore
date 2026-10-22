@@ -25,3 +25,4 @@ coverage.txt
 # Editor and OS
 .DS_Store
 *.swp
+/.slots/
