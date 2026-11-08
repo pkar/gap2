@@ -26,3 +26,9 @@ coverage.txt
 .DS_Store
 *.swp
 /.slots/
+
+# Agent instructions stay local
+AGENTS.md
+
+# Agent instructions stay local
+AGENTS.md
