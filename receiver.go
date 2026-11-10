@@ -51,6 +51,9 @@ type Receiver struct {
 	ln           net.Listener
 	adv          *zeroconf.Advertiser
 
+	// listen is overridable in tests; nil means net.Listen.
+	listen func(network, addr string) (net.Listener, error)
+
 	// ptpClock is the synchronized clock shared by the PTP listener and the
 	// media handlers. ptpGroup owns the live PTP sockets; ptpWG tracks the
 	// serve goroutine so shutdown can join it.
@@ -130,11 +133,22 @@ func (r *Receiver) Run(ctx context.Context) (err error) {
 		return err
 	}
 
-	ln, err := net.Listen("tcp", r.cfg.ListenAddr)
+	listen := r.listen
+	if listen == nil {
+		listen = net.Listen
+	}
+	ln, err := listen("tcp", r.cfg.ListenAddr)
 	if err != nil {
 		return err
 	}
 	r.mu.Lock()
+	if r.closed {
+		// Close ran while Run was still loading pairings or binding, when
+		// there was no listener for it to close.
+		r.mu.Unlock()
+		_ = ln.Close()
+		return nil
+	}
 	r.ln = ln
 	r.mu.Unlock()
 
@@ -144,6 +158,13 @@ func (r *Receiver) Run(ctx context.Context) (err error) {
 
 	adv, derr := startDiscovery(ctx, r.cfg, ln.Addr(), identity, store)
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		if derr == nil {
+			_ = adv.Close()
+		}
+		return nil
+	}
 	if derr == nil {
 		r.adv = adv
 	} else {
@@ -191,9 +212,15 @@ func (r *Receiver) startPTP(ctx context.Context) {
 		return
 	}
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		_ = group.Close()
+		return
+	}
 	r.ptpGroup = group
-	r.mu.Unlock()
+	// Add under the lock so it cannot race the Wait in Close.
 	r.ptpWG.Add(1)
+	r.mu.Unlock()
 	go func() {
 		defer r.ptpWG.Done()
 		if err := group.Serve(ctx); err != nil {

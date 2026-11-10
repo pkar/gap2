@@ -5,9 +5,14 @@ import (
 	"errors"
 	"io"
 	"net"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/pkar/gap2/internal/hap"
 )
 
 // bindUnavailable reports whether the test environment forbids network binds,
@@ -134,5 +139,102 @@ func TestEventsClosedOnClose(t *testing.T) {
 		if !ok {
 			return
 		}
+	}
+}
+
+// stubListener is a listener that never accepts and unblocks on Close.
+type stubListener struct {
+	closed chan struct{}
+	once   sync.Once
+	accept func() (net.Conn, error)
+}
+
+func newStubListener() *stubListener { return &stubListener{closed: make(chan struct{})} }
+
+func (l *stubListener) Accept() (net.Conn, error) {
+	if l.accept != nil {
+		if conn, err := l.accept(); conn != nil || err != nil {
+			return conn, err
+		}
+	}
+	<-l.closed
+	return nil, net.ErrClosed
+}
+func (l *stubListener) Close() error   { l.once.Do(func() { close(l.closed) }); return nil }
+func (l *stubListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7000} }
+
+// TestCloseDuringRunStartup closes the receiver after Run has passed its
+// closed check but before it has a listener. Run must stop instead of serving
+// on a receiver that reported itself closed.
+func TestCloseDuringRunStartup(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PairingsPath = filepath.Join(t.TempDir(), "pairings.json")
+	r, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln := newStubListener()
+	r.listen = func(string, string) (net.Listener, error) {
+		if err := r.Close(); err != nil {
+			t.Error(err)
+		}
+		return ln, nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run kept serving after Close")
+	}
+	select {
+	case <-ln.closed:
+	default:
+		t.Fatal("listener left open")
+	}
+	if got := r.Status().State; got != StateStopped {
+		t.Fatalf("state = %v, want stopped", got)
+	}
+}
+
+type temporaryError struct{}
+
+func (temporaryError) Error() string   { return "too many open files" }
+func (temporaryError) Timeout() bool   { return false }
+func (temporaryError) Temporary() bool { return true }
+
+// TestServeSurvivesTemporaryAcceptError checks that a passing accept failure
+// does not end the control server.
+func TestServeSurvivesTemporaryAcceptError(t *testing.T) {
+	var calls atomic.Int32
+	ln := newStubListener()
+	ln.accept = func() (net.Conn, error) {
+		if calls.Add(1) <= 2 {
+			return nil, temporaryError{}
+		}
+		return nil, nil
+	}
+	s := newControlServer(DefaultConfig().normalized(), hap.Identity{}, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.serve(ctx, ln) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for calls.Load() < 3 {
+		select {
+		case err := <-done:
+			t.Fatalf("serve ended on a temporary error: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("serve never retried Accept")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("serve = %v, want nil", err)
 	}
 }

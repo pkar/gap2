@@ -48,6 +48,7 @@ func (s *controlServer) serve(ctx context.Context, ln net.Listener) error {
 	stopListener := context.AfterFunc(ctx, func() { _ = ln.Close() })
 	defer stopListener()
 
+	var backoff time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -57,8 +58,21 @@ func (s *controlServer) serve(ctx context.Context, ln net.Listener) error {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
+			// Running out of descriptors or a connection reset in the accept
+			// queue passes; stopping the receiver for it would not.
+			if te, ok := err.(interface{ Temporary() bool }); ok && te.Temporary() {
+				backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
+				s.log.Warn("control accept failed; retrying", "err", err, "delay", backoff)
+				select {
+				case <-time.After(backoff):
+					continue
+				case <-ctx.Done():
+					return nil
+				}
+			}
 			return err
 		}
+		backoff = 0
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
