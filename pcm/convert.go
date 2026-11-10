@@ -21,8 +21,13 @@ type Converter struct {
 	output, input     Format
 	data              []float64
 	base, total, next int64
-	kernel            [1024][64]float64
-	closed            bool
+	// kernel holds the resampling filter, 1024 phases of 64 taps. It is half
+	// a megabyte, so it is built only when the rates differ.
+	kernel *[1024][64]float64
+	// mixed and resampled are scratch buffers reused across writes. They
+	// never leave the converter.
+	mixed, resampled []float64
+	closed           bool
 }
 
 func NewConverter(sink Sink, output Format) (*Converter, error) {
@@ -58,6 +63,9 @@ func (c *Converter) reset(f Format) {
 	c.next = 0
 	if f.Rate == c.output.Rate {
 		return
+	}
+	if c.kernel == nil {
+		c.kernel = new([1024][64]float64)
 	}
 	cutoff := math.Min(1, float64(c.output.Rate)/float64(f.Rate)) * 0.94
 	for p := range c.kernel {
@@ -104,7 +112,8 @@ func (c *Converter) Write(ctx context.Context, b Block) error {
 	if b.Format == c.output {
 		return c.sink.Write(ctx, b)
 	}
-	mixed := mix(b, c.output.Channels)
+	c.mixed = mix(c.mixed[:0], b, c.output.Channels)
+	mixed := c.mixed
 	if b.Format.Rate == c.output.Rate {
 		return c.writeSamples(ctx, mixed)
 	}
@@ -113,9 +122,26 @@ func (c *Converter) Write(ctx context.Context, b Block) error {
 	return c.emit(ctx, false)
 }
 
-func mix(b Block, channels int) []float64 {
-	out := make([]float64, b.Frames()*channels)
+// invSqrt2 is the -3 dB gain applied to center and surround channels.
+const invSqrt2 = math.Sqrt2 / 2
+
+// mix converts b to float samples in the given channel count, reusing dst's
+// storage when it is large enough.
+func mix(dst []float64, b Block, channels int) []float64 {
 	n := b.Format.Channels
+	size := b.Frames() * channels
+	if cap(dst) < size {
+		dst = make([]float64, size)
+	}
+	out := dst[:size]
+	if n == channels {
+		// Rate conversion only: the common stereo-to-stereo case.
+		for i := range out {
+			out[i] = float64(int16(binary.LittleEndian.Uint16(b.Data[2*i:])))
+		}
+		return out
+	}
+	clear(out) // upmixing leaves the added channels silent
 	var mapping [8]int
 	if channels > 2 && n > 1 && n != channels {
 		sources := speakerPositions(n)
@@ -134,10 +160,6 @@ func mix(b Block, channels int) []float64 {
 		for j := 0; j < n; j++ {
 			v[j] = float64(int16(binary.LittleEndian.Uint16(b.Data[(i*n+j)*2:])))
 		}
-		if n == channels {
-			copy(out[i*channels:], v[:n])
-			continue
-		}
 		if channels <= 2 {
 			l, r := v[0], v[0]
 			norm := 1.0
@@ -145,9 +167,9 @@ func mix(b Block, channels int) []float64 {
 				r = v[1]
 			}
 			if n > 2 {
-				l += v[2] * math.Sqrt(0.5)
-				r += v[2] * math.Sqrt(0.5)
-				norm += math.Sqrt(0.5)
+				l += v[2] * invSqrt2
+				r += v[2] * invSqrt2
+				norm += invSqrt2
 			}
 			if n == 4 {
 				l += v[3] * 0.5
@@ -155,14 +177,14 @@ func mix(b Block, channels int) []float64 {
 				norm += 0.5
 			}
 			if n == 5 {
-				l += v[3] * math.Sqrt(0.5)
-				r += v[4] * math.Sqrt(0.5)
-				norm += math.Sqrt(0.5)
+				l += v[3] * invSqrt2
+				r += v[4] * invSqrt2
+				norm += invSqrt2
 			}
 			if n >= 6 {
-				l += v[4] * math.Sqrt(0.5)
-				r += v[5] * math.Sqrt(0.5)
-				norm += math.Sqrt(0.5)
+				l += v[4] * invSqrt2
+				r += v[5] * invSqrt2
+				norm += invSqrt2
 			}
 			if n == 7 {
 				l += v[6] * 0.5
@@ -170,9 +192,9 @@ func mix(b Block, channels int) []float64 {
 				norm += 0.5
 			}
 			if n == 8 {
-				l += v[6] * math.Sqrt(0.5)
-				r += v[7] * math.Sqrt(0.5)
-				norm += math.Sqrt(0.5)
+				l += v[6] * invSqrt2
+				r += v[7] * invSqrt2
+				norm += invSqrt2
 			}
 			if channels == 1 {
 				out[i] = (l + r) / (2 * norm)
@@ -217,30 +239,55 @@ func (c *Converter) emit(ctx context.Context, tail bool) error {
 		return nil
 	}
 	n := c.output.Channels
-	out := make([]float64, 0)
+	inRate, outRate := int64(c.input.Rate), int64(c.output.Rate)
+	out := c.resampled[:0]
 	for {
-		center := c.next / int64(c.output.Rate)
+		center := c.next / outRate
 		if center >= c.total || (!tail && center+32 >= c.total) {
 			break
 		}
-		phase := (c.next % int64(c.output.Rate)) * 1024 / int64(c.output.Rate)
-		for ch := 0; ch < n; ch++ {
-			sum := 0.0
-			for j, w := range c.kernel[phase] {
-				index := center + int64(j) - 31
-				if index < 0 {
-					index = 0
+		kernel := &c.kernel[(c.next%outRate)*1024/outRate]
+		if first := center - 31; first >= 0 && center+32 < c.total {
+			// All 64 taps fall inside the buffered samples, which is every
+			// output sample except those at the very start or end of a
+			// stream, so the edge clamping below is not needed.
+			taps := c.data[(first-c.base)*int64(n):][:64*n]
+			if n == 2 {
+				var l, r float64
+				for j, w := range kernel {
+					l += taps[2*j] * w
+					r += taps[2*j+1] * w
 				}
-				if index >= c.total {
-					index = c.total - 1
+				out = append(out, l, r)
+			} else {
+				for ch := 0; ch < n; ch++ {
+					sum := 0.0
+					for j, w := range kernel {
+						sum += taps[j*n+ch] * w
+					}
+					out = append(out, sum)
 				}
-				sum += c.data[(index-c.base)*int64(n)+int64(ch)] * w
 			}
-			out = append(out, sum)
+		} else {
+			for ch := 0; ch < n; ch++ {
+				sum := 0.0
+				for j, w := range kernel {
+					index := center + int64(j) - 31
+					if index < 0 {
+						index = 0
+					}
+					if index >= c.total {
+						index = c.total - 1
+					}
+					sum += c.data[(index-c.base)*int64(n)+int64(ch)] * w
+				}
+				out = append(out, sum)
+			}
 		}
-		c.next += int64(c.input.Rate)
+		c.next += inRate
 	}
-	keep := c.next/int64(c.output.Rate) - 32
+	c.resampled = out
+	keep := c.next/outRate - 32
 	if keep > c.base {
 		if keep > c.total {
 			keep = c.total
