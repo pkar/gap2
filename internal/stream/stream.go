@@ -16,6 +16,14 @@ import (
 // packet.
 const aacFrameLen = 1024
 
+// ErrBadPacket marks an ingest failure that belongs to one packet: it could
+// not be parsed or decoded. The stream is still usable, so a datagram
+// transport drops the packet and carries on. Failures of the stream itself
+// (wrong state, a failed sink) are not wrapped in it.
+var ErrBadPacket = errors.New("stream: bad packet")
+
+func badPacket(err error) error { return fmt.Errorf("%w: %w", ErrBadPacket, err) }
+
 // Decoder decodes one audio access unit into interleaved 16-bit PCM. The
 // concrete AAC-LC and ALAC implementations plug in here.
 type Decoder interface {
@@ -277,7 +285,7 @@ func (s *Stream) ingestRTP(ctx context.Context, pkt []byte, sequence uint32, buf
 	}
 	p, err := rtp.Parse(pkt)
 	if err != nil {
-		return err
+		return badPacket(err)
 	}
 	s.mu.Lock()
 	if s.flushActive {
@@ -329,7 +337,7 @@ func (s *Stream) ingestRTP(ctx context.Context, pkt []byte, sequence uint32, buf
 		}
 	}
 	if pt != 0 && int(p.PayloadType) != pt {
-		return fmt.Errorf("stream: payload type %d, want %d", p.PayloadType, pt)
+		return badPacket(fmt.Errorf("stream: payload type %d, want %d", p.PayloadType, pt))
 	}
 	if media == nil {
 		return fmt.Errorf("stream: %w: no announced media", ErrUnsupported)
@@ -338,14 +346,14 @@ func (s *Stream) ingestRTP(ctx context.Context, pkt []byte, sequence uint32, buf
 	case "mpeg4-generic":
 		aus, err := rtp.ParseAACPayload(p.Payload)
 		if err != nil {
-			return err
+			return badPacket(err)
 		}
 		// Consecutive AAC-LC access units are one frame (1024 samples) apart
 		// in RTP timestamp units.
 		for i, au := range aus {
 			block, err := s.decoder.Decode(au.Data)
 			if err != nil {
-				return err
+				return s.decodeFailed(err)
 			}
 			if err := s.writeSink(ctx, p.Timestamp+uint32(i)*aacFrameLen, block); err != nil {
 				return err
@@ -356,10 +364,20 @@ func (s *Stream) ingestRTP(ctx context.Context, pkt []byte, sequence uint32, buf
 		// Native AirPlay packs exactly one raw access unit per packet.
 		block, err := s.decoder.Decode(p.Payload)
 		if err != nil {
-			return err
+			return s.decodeFailed(err)
 		}
 		return s.writeSink(ctx, p.Timestamp, block)
 	default:
 		return fmt.Errorf("stream: %w: %s ingest not implemented", ErrUnsupported, media.Encoding)
 	}
+}
+
+// decodeFailed reports a frame the decoder rejected. The decoder may have
+// stopped partway through it, so its carried state is reset before the next
+// frame.
+func (s *Stream) decodeFailed(err error) error {
+	s.mu.Lock()
+	s.resetDecoder = true
+	s.mu.Unlock()
+	return badPacket(err)
 }

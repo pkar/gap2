@@ -203,6 +203,10 @@ func (h *mediaHandler) announce(cs *connState, req *ctlRequest) error {
 		h.log.Debug("media codec rejected", "err", err)
 		return cs.writeRTSPResponse(cseq, 415, "Unsupported Media Type", nil, nil)
 	}
+	// A second ANNOUNCE replaces the stream. Release the first one's output,
+	// sockets and serve loop, or they leak and RECORD never starts the new
+	// stream.
+	h.closeAudio()
 	sink, err := h.openOutput(format)
 	if err != nil {
 		h.log.Debug("media sink open failed", "err", err)
@@ -223,11 +227,14 @@ func (h *mediaHandler) announce(cs *connState, req *ctlRequest) error {
 
 	sess, err := media.NewSession(streamID(req.target), m, out)
 	if err != nil {
+		h.closeAudio()
 		return cs.writeRTSPResponse(cseq, 415, "Unsupported Media Type", nil, nil)
 	}
 	if err := sess.Stream().Announce(m); err != nil {
+		h.closeAudio()
 		return cs.writeRTSPResponse(cseq, 400, "Bad Request", nil, nil)
 	}
+	sess.SetDropHandler(h.logDroppedPacket)
 	h.sess = sess
 	if h.clock != nil {
 		h.clock.ClearAnchor()
@@ -258,6 +265,11 @@ func (h *mediaHandler) setup(cs *connState, req *ctlRequest) error {
 		return cs.writeRTSPResponse(cseq, 461, "Unsupported Transport", nil, nil)
 	}
 
+	// Check the state before binding: a repeated SETUP would otherwise open
+	// a second socket over the first and leak it.
+	if h.sess.Stream().State() != stream.StateAnnounced {
+		return cs.writeRTSPResponse(cseq, 455, "Method Not Valid in This State", nil, nil)
+	}
 	bind := h.bind
 	if bind == nil {
 		bind = h.sess.Bind
@@ -300,24 +312,31 @@ func (h *mediaHandler) setupInitialAp2(cs *connState, cseq string, s *ap2SetupRe
 		return cs.writeRTSPResponse(cseq, 400, "Bad Request", nil, nil)
 	}
 
-	listen := h.listenEvent
-	if listen == nil {
-		listen = func() (net.Listener, error) { return net.Listen("tcp4", ":0") }
-	}
-	ln, err := listen()
-	if err != nil {
-		h.log.Debug("AP2 event listen failed", "err", err)
-		return cs.writeRTSPResponse(cseq, 500, "Internal Server Error", nil, nil)
+	// A repeated timing SETUP gets the event port it already has. Opening
+	// another listener each time would leak the previous one and its accept
+	// goroutine until the connection closed.
+	ln := h.eventLn
+	if ln == nil {
+		listen := h.listenEvent
+		if listen == nil {
+			listen = func() (net.Listener, error) { return net.Listen("tcp4", ":0") }
+		}
+		var err error
+		if ln, err = listen(); err != nil {
+			h.log.Debug("AP2 event listen failed", "err", err)
+			return cs.writeRTSPResponse(cseq, 500, "Internal Server Error", nil, nil)
+		}
+		h.eventLn = ln
+
+		// Start serving the encrypted event channel once the sender connects
+		// to the advertised port. The listener is passed explicitly (rather
+		// than read from h.eventLn) to avoid racing with close() during
+		// teardown.
+		if len(cs.sessionKey) > 0 {
+			go h.serveEvent(ln, cs.sessionKey, cs.legacySetup)
+		}
 	}
 	port := uint16(ln.Addr().(*net.TCPAddr).Port)
-	h.eventLn = ln
-
-	// Start serving the encrypted event channel once the sender connects to
-	// the advertised port. The listener is passed explicitly (rather than read
-	// from h.eventLn) to avoid racing with close() during teardown.
-	if len(cs.sessionKey) > 0 {
-		go h.serveEvent(ln, cs.sessionKey, cs.legacySetup)
-	}
 
 	body, err := buildAp2InitialResponse(port, localIP(cs.conn))
 	if err != nil {
@@ -357,6 +376,11 @@ func (h *mediaHandler) setupStreamAp2(cs *connState, cseq string, s *ap2SetupReq
 		}
 	}
 
+	// As in the Transport-header SETUP: a stream that is already set up
+	// keeps its sockets.
+	if h.sess.Stream().State() != stream.StateAnnounced {
+		return cs.writeRTSPResponse(cseq, 455, "Method Not Valid in This State", nil, nil)
+	}
 	bind := h.bind
 	if bind == nil {
 		bind = h.sess.Bind
@@ -492,12 +516,16 @@ func (h *mediaHandler) openNativeStream(entry *plist.Value) error {
 	}
 	sess.SetPacketDecoder(decryptor.Open)
 	sess.SetRecoveryHandler(func(err error) { h.log.Info("audio transport disconnected; waiting for reconnect", "err", err) })
+	sess.SetDropHandler(h.logDroppedPacket)
 	if integer("type", 0) == ap2StreamBuffered {
 		var previousFormat uint32
 		var first bool
 		var firstFrame uint32
 		var frames, lastReport uint64
 		started := time.Now()
+		// This closure runs on the serve goroutine, and closeAudio clears
+		// h.playout from the control goroutine, so read it once here.
+		po := h.playout
 		sess.SetPacketDecoder(func(packet []byte) ([]byte, error) {
 			plain, err := decryptor.OpenBuffered(packet)
 			if err != nil {
@@ -526,8 +554,8 @@ func (h *mediaHandler) openNativeStream(entry *plist.Value) error {
 					}
 					h.log.Debug("AP2 audio progress", "durationSeconds", time.Since(started).Seconds(), "packets", frames, "rtpSpan", uint32(frame-firstFrame),
 						"playedFrames", position.Frames, "queueMs", position.Latency.Milliseconds(), "underruns", position.Underruns, "leadMs", lead)
-					if h.playout != nil {
-						padding, trimming, skew := h.playout.Correction()
+					if po != nil {
+						padding, trimming, skew := po.Correction()
 						h.log.Debug("AP2 output alignment", "paddingMs", padding.Milliseconds(), "trimmingMs", trimming.Milliseconds(), "skewUs", skew.Microseconds())
 					}
 				}
@@ -546,6 +574,12 @@ func (h *mediaHandler) openNativeStream(entry *plist.Value) error {
 		h.clock.ClearAnchor()
 	}
 	return nil
+}
+
+// logDroppedPacket reports realtime datagrams that failed authentication or
+// did not decode. The session calls it at doubling totals, not per packet.
+func (h *mediaHandler) logDroppedPacket(err error, total uint64) {
+	h.log.Warn("dropped audio packet", "total", total, "err", err)
 }
 
 func (h *mediaHandler) openOutput(input pcm.Format) (pcm.Sink, error) {
@@ -723,6 +757,7 @@ func (h *mediaHandler) teardown(cs *connState, req *ctlRequest) error {
 
 func (h *mediaHandler) flush(cs *connState, req *ctlRequest) error {
 	cseq := reqHeader(req, "CSeq")
+	deferred := false
 	if req.method == "FLUSHBUFFERED" && h.sess != nil {
 		v, err := plist.Decode(req.body, plist.DefaultLimits())
 		if err != nil || v.Kind != plist.KindDict {
@@ -744,10 +779,18 @@ func (h *mediaHandler) flush(cs *connState, req *ctlRequest) error {
 				fromSeq = &f
 			}
 			h.sess.Stream().FlushBufferedRange(uint32(seq), fromSeq)
-			h.log.Debug("AP2 flush", "until", uint32(until), "untilSeq", uint32(seq)&0x7fffff, "deferred", fromSeq != nil)
+			deferred = fromSeq != nil
+			h.log.Debug("AP2 flush", "until", uint32(until), "untilSeq", uint32(seq)&0x7fffff, "deferred", deferred)
 		} else {
 			h.sess.Stream().FlushRange(uint32(until), from)
+			deferred = from != nil
 		}
+	}
+	// A flush with a start point takes effect when playback reaches it: the
+	// audio before it is still due, so the output keeps what it has queued
+	// and the stream drops the range as it comes up.
+	if deferred {
+		return cs.writeRTSPResponse(cseq, 200, "OK", nil, nil)
 	}
 	if h.playout != nil {
 		_ = h.playout.Flush(h.ctx)

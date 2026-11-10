@@ -114,6 +114,25 @@ type Session struct {
 	tcpConn      net.Conn
 	decodePacket func([]byte) ([]byte, error)
 	onRecovery   func(error)
+	onDrop       func(error, uint64)
+	dropped      atomic.Uint64
+}
+
+// SetDropHandler installs diagnostics for datagrams dropped by Serve. It is
+// called with the running total on the first drop and then each time the
+// total doubles, so a stream of bad packets cannot flood a log. Install it
+// before Serve starts.
+func (s *Session) SetDropHandler(fn func(err error, total uint64)) { s.onDrop = fn }
+
+// Dropped returns how many datagrams Serve has dropped because they failed
+// authentication or did not decode.
+func (s *Session) Dropped() uint64 { return s.dropped.Load() }
+
+func (s *Session) drop(err error) {
+	n := s.dropped.Add(1)
+	if s.onDrop != nil && n&(n-1) == 0 {
+		s.onDrop(err, n)
+	}
 }
 
 // SetPacketDecoder installs authenticated packet decryption before Serve.
@@ -142,6 +161,17 @@ func (s *Session) Stream() *stream.Stream { return s.stream }
 // Bind binds the RTP receiver on the given network/address and returns the
 // bound UDP port for the RTSP SETUP response. Port 0 selects an ephemeral port.
 func (s *Session) Bind(network, addr string) (int, error) {
+	// A second Bind replaces the first, for a SETUP retried after a failure.
+	// Close what the first one opened, or it stays bound until the process
+	// exits.
+	if s.tcp != nil {
+		_ = s.tcp.Close()
+		s.tcp = nil
+	}
+	if s.recv != nil {
+		_ = s.recv.Close()
+		s.recv = nil
+	}
 	if network == "tcp4" {
 		ln, err := net.Listen(network, addr)
 		if err != nil {
@@ -175,15 +205,24 @@ func (s *Session) Serve(ctx context.Context) error {
 	if s.recv == nil {
 		return errors.New("media: serve before bind")
 	}
+	// UDP delivers whatever reaches the port: a damaged datagram, or one from
+	// another host. Such a packet is dropped. Ending Serve for it would
+	// silence the stream until the sender set it up again.
 	return s.recv.Serve(ctx, func(pkt []byte) error {
 		if s.decodePacket != nil {
-			var err error
-			pkt, err = s.decodePacket(pkt)
+			plain, err := s.decodePacket(pkt)
 			if err != nil {
-				return err
+				s.drop(err)
+				return nil
 			}
+			pkt = plain
 		}
-		return s.ingest(ctx, pkt)
+		err := s.ingest(ctx, pkt)
+		if errors.Is(err, stream.ErrBadPacket) {
+			s.drop(err)
+			return nil
+		}
+		return err
 	})
 }
 
