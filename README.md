@@ -21,7 +21,7 @@ airplay2-receiver run -name gap2 \
   -output-rate 48000 -output-channels 2
 ```
 
-Linux amd64/arm64 uses native ALSA playback. Other platforms can capture S16LE PCM with `-output audio.pcm` or provide a sink through the Go API. The sample [systemd service](deploy/gap2.service) reads device and interface settings from an external environment file; keep machine-specific configuration outside this repository. See `airplay2-receiver run -help` for flags.
+Linux amd64/arm64 uses native ALSA playback. Other platforms, including 32-bit ARM, build but have no ALSA output: `-audio-device` is refused at startup there. They can capture S16LE PCM with `-output audio.pcm` or provide a sink through the Go API. The sample [systemd service](deploy/gap2.service) reads device and interface settings from an external environment file; keep machine-specific configuration outside this repository. See `airplay2-receiver run -help` for flags.
 
 ## Support
 

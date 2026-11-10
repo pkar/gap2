@@ -15,6 +15,8 @@ import (
 	"github.com/pkar/gap2/pcm"
 )
 
+const supported = true
+
 // Structures and requests from Linux UAPI sound/asound.h, 64-bit ABI.
 type interval struct{ Min, Max, Flags uint32 }
 type hwParams struct {

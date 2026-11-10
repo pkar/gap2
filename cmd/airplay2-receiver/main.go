@@ -93,6 +93,12 @@ func run(args []string) {
 		os.Exit(2)
 	}
 	if *device != "" {
+		if !alsa.Supported() {
+			// Say so now. Otherwise the receiver starts, pairs, and fails
+			// each stream when it opens the device.
+			fmt.Fprintln(os.Stderr, "airplay2-receiver: -audio-device needs Linux on amd64 or arm64; use -output on this platform")
+			os.Exit(2)
+		}
 		out = alsa.Device(*device)
 	}
 	if *output != "" {

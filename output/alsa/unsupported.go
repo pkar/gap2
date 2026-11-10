@@ -8,6 +8,8 @@ import (
 	"github.com/pkar/gap2/pcm"
 )
 
+const supported = false
+
 func open(context.Context, string, pcm.Format) (pcm.Sink, error) {
 	return nil, errors.New("alsa: native playback requires Linux amd64 or arm64")
 }
