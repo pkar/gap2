@@ -37,6 +37,7 @@ test:
 
 vet:
 	$(GO) vet ./...
+	GOOS=linux GOARCH=arm $(GO) vet ./...
 
 install: build
 	install -d "$(DESTDIR)$(BINDIR)"

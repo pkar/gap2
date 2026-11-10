@@ -135,12 +135,13 @@ func countNodes(v *Value, depth int, limits Limits) (int, error) {
 }
 
 func bytesFor(maxValue int) int {
-	switch {
-	case maxValue <= 0xFF:
+	// Compare as int64: 0xFFFFFFFF does not fit int on 32-bit platforms.
+	switch v := int64(maxValue); {
+	case v <= 0xFF:
 		return 1
-	case maxValue <= 0xFFFF:
+	case v <= 0xFFFF:
 		return 2
-	case maxValue <= 0xFFFFFFFF:
+	case v <= 0xFFFFFFFF:
 		return 4
 	default:
 		return 8

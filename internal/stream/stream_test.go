@@ -171,7 +171,7 @@ func TestBufferedFlushSequenceSurvivesTimestampEpochChange(t *testing.T) {
 		for i, seq := range []uint32{0x7ffffe, 0x7fffff, 0, 1, 2} {
 			ts := uint32(3504865437)
 			if i >= 3 {
-				ts = uint32(3348046257 + (i-3)*1024)
+				ts = 3348046257 + uint32(i-3)*1024
 			}
 			if err := s.IngestBufferedRTP(context.Background(), rtpPacketTS([]byte{0}, ts), seq); err != nil {
 				t.Fatal(err)
