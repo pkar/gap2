@@ -121,10 +121,11 @@ const rebaseSamples = 16
 
 // masterHold is how long a grandmaster may go without being announced before
 // an Announce for another one replaces it: IEEE 1588's announceReceiptTimeout
-// of three intervals at Apple's one-second announce interval. Another sender
-// playing to its own group on the same network multicasts its grandmaster
-// too, and following whichever announced last alternates the offset between
-// two unrelated epochs several times a second.
+// of three intervals at a one-second announce interval, and a dozen of the
+// 250 ms intervals Apple senders use, so a Wi-Fi stall does not drop it.
+// Another sender playing to its own group on the same network multicasts its
+// grandmaster too, and following whichever announced last alternates the
+// offset between two unrelated epochs several times a second.
 const masterHold uint64 = 3_000_000_000
 
 // maxHeard bounds the grandmasters remembered in Clock.heard.
