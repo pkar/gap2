@@ -61,7 +61,7 @@ func TestHandleAnnounceWithoutOffsetClearsAnchor(t *testing.T) {
 	c.SetAnchor(Anchor{Frame: 100, MasterNs: 1_000_000_000, Rate: 44100})
 
 	gm1 := [8]byte{1}
-	c.HandleAnnounce(Message{Grandmaster: gm1})
+	c.HandleAnnounce(Message{Grandmaster: gm1}, 0)
 	if _, ok := c.Anchor(); !ok {
 		t.Fatal("anchor cleared on first Announce")
 	}
@@ -69,7 +69,7 @@ func TestHandleAnnounceWithoutOffsetClearsAnchor(t *testing.T) {
 	// No offset to the old master: the anchor cannot be placed in local
 	// time, so a change of master discards it.
 	gm2 := [8]byte{2}
-	c.HandleAnnounce(Message{Grandmaster: gm2})
+	c.HandleAnnounce(Message{Grandmaster: gm2}, masterHold)
 	if _, ok := c.Anchor(); ok {
 		t.Fatal("unsynchronized anchor retained across grandmaster change")
 	}
@@ -85,7 +85,7 @@ func TestGrandmasterChangeCarriesAnchor(t *testing.T) {
 	gm1, gm2 := [8]byte{1}, [8]byte{2}
 	var events []MasterChange
 	c.SetMasterChangeHandler(func(e MasterChange) { events = append(events, e) })
-	c.HandleAnnounce(Message{Grandmaster: gm1})
+	c.HandleAnnounce(Message{Grandmaster: gm1}, 100_000_000_000)
 	local := followUp(c, 100_000_000_000, 5_000_000_000, 4)
 	c.SetAnchor(Anchor{Frame: 1000, MasterNs: 106_000_000_000, Rate: 48000, ClockID: gm1})
 	due, ok := c.FrameLocalTime(49000) // one second after the anchor frame
@@ -93,7 +93,12 @@ func TestGrandmasterChangeCarriesAnchor(t *testing.T) {
 		t.Fatalf("FrameLocalTime before change = %d, %v", due, ok)
 	}
 
-	c.HandleAnnounce(Message{Grandmaster: gm2})
+	// The new master is kept out while the old one still announces.
+	c.HandleAnnounce(Message{Grandmaster: gm2}, 100_000_000_000+masterHold-1)
+	if len(events) != 0 {
+		t.Fatalf("switched while the old master was announcing: %+v", events)
+	}
+	c.HandleAnnounce(Message{Grandmaster: gm2}, 100_000_000_000+masterHold)
 	if _, ok := c.Offset(); ok {
 		t.Fatal("offset retained across grandmaster change")
 	}
@@ -128,14 +133,14 @@ func TestGrandmasterChangeCarriesAnchor(t *testing.T) {
 func TestGrandmasterFlapKeepsCarriedAnchor(t *testing.T) {
 	c := NewClock()
 	gm1, gm2 := [8]byte{1}, [8]byte{2}
-	c.HandleAnnounce(Message{Grandmaster: gm1})
+	c.HandleAnnounce(Message{Grandmaster: gm1}, 0)
 	local := followUp(c, 100_000_000_000, 5_000_000_000, 4)
 	c.SetAnchor(Anchor{Frame: 0, MasterNs: 106_000_000_000, Rate: 48000})
 	due, _ := c.FrameLocalTime(0)
 
-	c.HandleAnnounce(Message{Grandmaster: gm2})
+	c.HandleAnnounce(Message{Grandmaster: gm2}, masterHold)
 	local = followUp(c, local, 9_000_000_000, 2)
-	c.HandleAnnounce(Message{Grandmaster: gm1})
+	c.HandleAnnounce(Message{Grandmaster: gm1}, 2*masterHold)
 	if got, ok := c.FrameLocalTime(0); !ok || got != due {
 		t.Fatalf("FrameLocalTime after flap = %d, %v; want %d", got, ok, due)
 	}
@@ -157,7 +162,7 @@ func TestClockStepsToNewTimeBase(t *testing.T) {
 	c := NewClock()
 	var steps []Step
 	c.SetStepHandler(func(s Step) { steps = append(steps, s) })
-	c.HandleAnnounce(Message{Grandmaster: [8]byte{1}})
+	c.HandleAnnounce(Message{Grandmaster: [8]byte{1}}, 0)
 	local := followUp(c, 100_000_000_000, 50_000_000_000_000, 8) // 50,000 s ahead
 	c.SetAnchor(Anchor{Frame: 0, MasterNs: 50_101_000_000_000, Rate: 48000})
 	if due, _ := c.FrameLocalTime(0); due != 101_000_000_000 {
@@ -203,17 +208,17 @@ func TestClockPrefersGrandmasterSync(t *testing.T) {
 		h := Header{ClockID: from}
 		c.HandleFollowUp(Message{Header: h, Precise: Timestamp{Seconds: master / 1_000_000_000, Nanos: uint32(master % 1_000_000_000)}}, local)
 	}
-	c.HandleAnnounce(Message{Header: Header{ClockID: relay}, Grandmaster: gm})
+	c.HandleAnnounce(Message{Header: Header{ClockID: relay}, Grandmaster: gm}, 0)
 	sample(relay, 100_000_000_000, 7_000_000_000)
 	sample(gm, 100_000_000_000, 3_000_000_000)
 	if offset, _ := c.Offset(); offset != 7_000_000_000 {
 		t.Fatalf("offset = %d, want the relay's until the grandmaster announces", offset)
 	}
-	c.HandleAnnounce(Message{Header: Header{ClockID: relay}, Grandmaster: gm})
+	c.HandleAnnounce(Message{Header: Header{ClockID: relay}, Grandmaster: gm}, 0)
 	if len(changes) != 0 {
 		t.Fatalf("relay announce changed the source: %+v", changes)
 	}
-	c.HandleAnnounce(Message{Header: Header{ClockID: gm}, Grandmaster: gm})
+	c.HandleAnnounce(Message{Header: Header{ClockID: gm}, Grandmaster: gm}, 0)
 	if len(changes) != 1 || changes[0] != (SourceChange{From: relay, To: gm}) {
 		t.Fatalf("source changes = %+v", changes)
 	}
@@ -224,18 +229,132 @@ func TestClockPrefersGrandmasterSync(t *testing.T) {
 	if offset, _ := c.Offset(); offset != 3_000_000_000 {
 		t.Fatalf("offset = %d, want the grandmaster's", offset)
 	}
-	c.HandleAnnounce(Message{Header: Header{ClockID: gm}, Grandmaster: gm})
+	c.HandleAnnounce(Message{Header: Header{ClockID: gm}, Grandmaster: gm}, 0)
 	if len(changes) != 1 {
 		t.Fatalf("repeated grandmaster announce changed the source again: %+v", changes)
 	}
 }
 
+// followUpFrom feeds n Follow_Up samples from clock src whose master time is
+// local+offset.
+func followUpFrom(c *Clock, src [8]byte, local uint64, offset int64, n int) uint64 {
+	for i := 0; i < n; i++ {
+		master := uint64(int64(local) + offset)
+		c.HandleFollowUp(Message{Header: Header{ClockID: src}, Precise: Timestamp{Seconds: master / 1_000_000_000, Nanos: uint32(master % 1_000_000_000)}}, local)
+		local += 125_000_000
+	}
+	return local
+}
+
+// announce sends an Announce from grandmaster gm itself.
+func announce(c *Clock, gm [8]byte, local uint64) {
+	c.HandleAnnounce(Message{Header: Header{ClockID: gm}, Grandmaster: gm}, local)
+}
+
+// Two senders playing to their own groups on one network each multicast a
+// grandmaster. The first one heard stays selected while it announces.
+func TestClockKeepsAnnouncingGrandmaster(t *testing.T) {
+	c := NewClock()
+	gm1, gm2 := [8]byte{1}, [8]byte{2}
+	var events []MasterChange
+	c.SetMasterChangeHandler(func(e MasterChange) { events = append(events, e) })
+	local := uint64(100_000_000_000)
+	for range 40 {
+		announce(c, gm1, local)
+		announce(c, gm2, local+125_000_000)
+		followUpFrom(c, gm1, local, 5_000_000_000, 1)
+		followUpFrom(c, gm2, local, -48_000_000_000_000, 1)
+		local += 250_000_000
+	}
+	if len(events) != 0 {
+		t.Fatalf("master changes = %+v", events)
+	}
+	if offset, ok := c.Offset(); !ok || offset != 5_000_000_000 {
+		t.Fatalf("offset = %d, %v; want the first grandmaster's", offset, ok)
+	}
+}
+
+// The sender's anchor names its grandmaster. When another group's was
+// selected first, the anchor switches to it at once and keeps it.
+func TestAnchorSelectsItsTimeline(t *testing.T) {
+	c := NewClock()
+	other, sender := [8]byte{1}, [8]byte{2}
+	var events []MasterChange
+	c.SetMasterChangeHandler(func(e MasterChange) { events = append(events, e) })
+	local := uint64(100_000_000_000)
+	announce(c, other, local)
+	announce(c, sender, local+125_000_000)
+	local = followUpFrom(c, other, local, -48_000_000_000_000, 4)
+
+	c.SetAnchor(Anchor{Frame: 0, MasterNs: 106_000_000_000, Rate: 48000, ClockID: sender})
+	if len(events) != 1 || events[0] != (MasterChange{From: other, To: sender, AnchorTimeline: true}) {
+		t.Fatalf("master changes = %+v", events)
+	}
+	if _, ok := c.FrameLocalTime(0); ok {
+		t.Fatal("anchor scheduled with the other grandmaster's offset")
+	}
+	local = followUpFrom(c, other, local, -48_000_000_000_000, 1)
+	local = followUpFrom(c, sender, local, 5_000_000_000, 1)
+	if due, ok := c.FrameLocalTime(0); !ok || due != 101_000_000_000 {
+		t.Fatalf("FrameLocalTime = %d, %v; want 101s", due, ok)
+	}
+
+	// The other grandmaster keeps announcing, across sessions too.
+	c.ClearAnchor()
+	for range 20 {
+		announce(c, other, local)
+		announce(c, sender, local+125_000_000)
+		local = followUpFrom(c, other, local, -48_000_000_000_000, 1)
+		local = followUpFrom(c, sender, local, 5_000_000_000, 1)
+	}
+	if len(events) != 1 {
+		t.Fatalf("master changes = %+v", events)
+	}
+	if offset, _ := c.Offset(); offset != 5_000_000_000 {
+		t.Fatalf("offset = %d, want the sender's", offset)
+	}
+}
+
+// An anchor for a grandmaster nobody announces leaves the selection alone.
+func TestAnchorForSilentTimelineKeepsMaster(t *testing.T) {
+	c := NewClock()
+	gm := [8]byte{1}
+	announce(c, gm, 100_000_000_000)
+	followUpFrom(c, gm, 100_000_000_000, 5_000_000_000, 1)
+	c.SetAnchor(Anchor{Frame: 0, MasterNs: 106_000_000_000, Rate: 48000, ClockID: [8]byte{9}})
+	if got := c.Info().MasterID; got != gm {
+		t.Fatalf("master = %x, want %x", got, gm)
+	}
+	if _, ok := c.Offset(); !ok {
+		t.Fatal("offset dropped for an unannounced timeline")
+	}
+}
+
+// When the sender's grandmaster falls silent another takes over, and the
+// sender's grandmaster takes back over as soon as it announces again.
+func TestTimelineReclaimsMaster(t *testing.T) {
+	c := NewClock()
+	gm1, gm2 := [8]byte{1}, [8]byte{2}
+	local := uint64(100_000_000_000)
+	announce(c, gm1, local)
+	c.SetAnchor(Anchor{Frame: 0, MasterNs: 106_000_000_000, Rate: 48000, ClockID: gm1})
+	announce(c, gm2, local+masterHold)
+	if got := c.Info().MasterID; got != gm2 {
+		t.Fatalf("master = %x, want %x after the timeline went quiet", got, gm2)
+	}
+	announce(c, gm2, local+masterHold+125_000_000)
+	announce(c, gm1, local+masterHold+250_000_000)
+	if got := c.Info().MasterID; got != gm1 {
+		t.Fatalf("master = %x, want the timeline %x back", got, gm1)
+	}
+}
+
 func TestChangeRateWhileCarried(t *testing.T) {
 	c := NewClock()
-	c.HandleAnnounce(Message{Grandmaster: [8]byte{1}})
+	c.HandleAnnounce(Message{Grandmaster: [8]byte{1}}, 0)
 	followUp(c, 100_000_000_000, 5_000_000_000, 1)
 	c.SetAnchor(Anchor{Frame: 1000, MasterNs: 106_000_000_000, Rate: 44100})
-	c.HandleAnnounce(Message{Grandmaster: [8]byte{2}})
+	c.HandleAnnounce(Message{Grandmaster: [8]byte{2}}, masterHold)
 	c.ChangeRate(45100, 48000) // the transition frame plays at local 102s
 	if got, ok := c.FrameLocalTime(45100 + 48000); !ok || got != 103_000_000_000 {
 		t.Fatalf("FrameLocalTime after carried rate change = %d, %v", got, ok)

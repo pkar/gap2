@@ -682,7 +682,7 @@ func TestHandleControlPacketZeroRate(t *testing.T) {
 // matches the selected grandmaster is adopted.
 func TestHandleControlPacketClockMatch(t *testing.T) {
 	clock := ptp.NewClock()
-	clock.HandleAnnounce(ptp.Message{Grandmaster: testClockID})
+	clock.HandleAnnounce(ptp.Message{Grandmaster: testClockID}, 0)
 	h := &mediaHandler{log: slog.Default(), clock: clock}
 	h.handleControlPacket(ap2TimingPacket(1000, 5_000_000_000), 44100)
 
@@ -700,11 +700,33 @@ func TestHandleControlPacketClockMatch(t *testing.T) {
 func TestHandleControlPacketClockMismatch(t *testing.T) {
 	clock := ptp.NewClock()
 	master := [8]byte{0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88}
-	clock.HandleAnnounce(ptp.Message{Grandmaster: master})
+	clock.HandleAnnounce(ptp.Message{Grandmaster: master}, 0)
 	h := &mediaHandler{log: slog.Default(), clock: clock}
 	h.handleControlPacket(ap2TimingPacket(1000, 5_000_000_000), 44100) // testClockID != master
 
 	if _, ok := clock.Anchor(); ok {
 		t.Fatal("anchor set despite clock mismatch")
+	}
+}
+
+// TestHandleControlPacketSelectsAnnouncedClock covers another group's
+// grandmaster being selected first: the packet's clock is announcing too, so
+// the clock switches to it and the anchor is adopted.
+func TestHandleControlPacketSelectsAnnouncedClock(t *testing.T) {
+	clock := ptp.NewClock()
+	other := [8]byte{0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88}
+	clock.HandleAnnounce(ptp.Message{Header: ptp.Header{ClockID: other}, Grandmaster: other}, 0)
+	clock.HandleAnnounce(ptp.Message{Header: ptp.Header{ClockID: testClockID}, Grandmaster: testClockID}, 250_000_000)
+	if got := clock.Info().MasterID; got != other {
+		t.Fatalf("master = %x, want the first announced %x", got, other)
+	}
+	h := &mediaHandler{log: slog.Default(), clock: clock}
+	h.handleControlPacket(ap2TimingPacket(1000, 5_000_000_000), 44100)
+
+	if a, ok := clock.Anchor(); !ok || a.ClockID != testClockID {
+		t.Fatalf("anchor = %+v, %v; want one for %x", a, ok, testClockID)
+	}
+	if got := clock.Info().MasterID; got != testClockID {
+		t.Fatalf("master = %x, want the anchor's %x", got, testClockID)
 	}
 }

@@ -98,7 +98,7 @@ func (l *Listener) handle(pkt []byte) {
 	case TypeFollowUp:
 		l.clock.HandleFollowUp(m, now)
 	case TypeAnnounce:
-		l.clock.HandleAnnounce(m)
+		l.clock.HandleAnnounce(m, now)
 	}
 }
 

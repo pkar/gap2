@@ -198,7 +198,7 @@ func (r *Receiver) Events() <-chan Event {
 // but cannot synchronize its clock, which is logged rather than failing Run.
 func (r *Receiver) startPTP(ctx context.Context) {
 	r.ptpClock.SetMasterChangeHandler(func(e ptp.MasterChange) {
-		r.log.Info("PTP grandmaster changed", "from", fmt.Sprintf("%x", e.From), "to", fmt.Sprintf("%x", e.To), "anchorCarried", e.Carried)
+		r.log.Info("PTP grandmaster changed", "from", fmt.Sprintf("%x", e.From), "to", fmt.Sprintf("%x", e.To), "anchorCarried", e.Carried, "anchorTimeline", e.AnchorTimeline)
 	})
 	r.ptpClock.SetSourceChangeHandler(func(e ptp.SourceChange) {
 		r.log.Info("PTP sync source changed to the grandmaster", "from", fmt.Sprintf("%x", e.From), "to", fmt.Sprintf("%x", e.To))

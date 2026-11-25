@@ -52,6 +52,15 @@ type Clock struct {
 	stepCount int
 	stepRaw   int64
 
+	// timeline is the grandmaster the sender's latest anchor refers to (its
+	// networkTimeTimelineID), zero until an anchor names one. It outlives the
+	// anchor, so the next session from the same sender starts on it.
+	timeline [8]byte
+	// heard records, per grandmaster, the clock that announced it and when.
+	// lastAnnounceNs is the receive time of the newest Announce.
+	heard          map[[8]byte]heardMaster
+	lastAnnounceNs uint64
+
 	// onMasterChange, when set, is called after a grandmaster change.
 	onMasterChange func(MasterChange)
 	// onStep, when set, is called after the offset steps.
@@ -110,12 +119,31 @@ func (c *Clock) SetSourceChangeHandler(f func(SourceChange)) {
 // microseconds.
 const rebaseSamples = 16
 
+// masterHold is how long a grandmaster may go without being announced before
+// an Announce for another one replaces it: IEEE 1588's announceReceiptTimeout
+// of three intervals at Apple's one-second announce interval. Another sender
+// playing to its own group on the same network multicasts its grandmaster
+// too, and following whichever announced last alternates the offset between
+// two unrelated epochs several times a second.
+const masterHold uint64 = 3_000_000_000
+
+// maxHeard bounds the grandmasters remembered in Clock.heard.
+const maxHeard = 8
+
+type heardMaster struct {
+	source [8]byte
+	atNs   uint64
+}
+
 // MasterChange describes a switch from one grandmaster to another.
 type MasterChange struct {
 	From, To [8]byte
 	// Carried reports that the playback anchor is kept in local time until
 	// the new grandmaster's offset settles.
 	Carried bool
+	// AnchorTimeline reports that the sender's anchor named the new
+	// grandmaster.
+	AnchorTimeline bool
 }
 
 // SetMasterChangeHandler registers f to be called, outside the clock's lock,
@@ -172,10 +200,16 @@ func (c *Clock) Status() Status {
 // NewClock returns an empty Clock.
 func NewClock() *Clock { return &Clock{} }
 
-// HandleAnnounce records the grandmaster identity from an Announce message.
-// The clock identity is taken from the grandmasterIdentity field carried in
-// the Announce body (m.Grandmaster). The offset is reset if the grandmaster
-// changes, because the new master's epoch may differ.
+// HandleAnnounce records the grandmaster identity from an Announce message
+// received at local monotonic time localNs. The clock identity is taken from
+// the grandmasterIdentity field carried in the Announce body
+// (m.Grandmaster). The offset is reset if the grandmaster changes, because
+// the new master's epoch may differ.
+//
+// The selected grandmaster is kept while it keeps announcing: an Announce
+// for another one switches only after masterHold without the current one,
+// or when it names the sender's anchor timeline. A network can carry several
+// AirPlay groups, each with its own grandmaster.
 //
 // A change from one master to another happens mid-stream when speakers join
 // or leave the group. The playback anchor maps RTP frames to the old
@@ -192,8 +226,9 @@ func NewClock() *Clock { return &Clock{} }
 // as the Sync source, but the grandmaster's own Sync is preferred as soon as
 // it announces: a relaying speaker can send Sync in another time base while
 // it joins or leaves the grandmaster's timeline.
-func (c *Clock) HandleAnnounce(m Message) {
+func (c *Clock) HandleAnnounce(m Message, localNs uint64) {
 	c.mu.Lock()
+	c.hear(m, localNs)
 	if m.Grandmaster == c.masterID {
 		var notify func(SourceChange)
 		event := SourceChange{From: c.sourceID, To: m.Header.ClockID}
@@ -212,9 +247,14 @@ func (c *Clock) HandleAnnounce(m Message) {
 		}
 		return
 	}
+	if c.keepsMaster(m.Grandmaster, localNs) {
+		c.mu.Unlock()
+		return
+	}
 	from := c.masterID
 	changed := from != [8]byte{}
-	if changed && c.anchorSet && !c.carried {
+	// An anchor already in the new master's epoch needs no carrying.
+	if changed && c.anchorSet && !c.carried && c.anchor.ClockID != m.Grandmaster {
 		if c.valid {
 			c.carriedNs = uint64(int64(c.anchor.MasterNs) - c.offsetNs)
 			c.carried = true
@@ -222,18 +262,70 @@ func (c *Clock) HandleAnnounce(m Message) {
 			c.anchorSet = false
 		}
 	}
-	c.masterID = m.Grandmaster
-	c.sourceID = m.Header.ClockID
+	c.selectMaster(m.Grandmaster, m.Header.ClockID)
+	notify, event := c.onMasterChange, MasterChange{
+		From: from, To: m.Grandmaster,
+		Carried:        c.anchorSet && c.carried,
+		AnchorTimeline: m.Grandmaster == c.timeline,
+	}
+	c.mu.Unlock()
+	if changed && notify != nil {
+		notify(event)
+	}
+}
+
+// keepsMaster reports whether an Announce for grandmaster gm at localNs
+// leaves the selected grandmaster in place: it was announced within
+// masterHold, and gm is not the sender's anchor timeline.
+func (c *Clock) keepsMaster(gm [8]byte, localNs uint64) bool {
+	if c.masterID == ([8]byte{}) || (c.timeline != [8]byte{} && gm == c.timeline) {
+		return false
+	}
+	return c.recent(c.masterID, localNs)
+}
+
+// recent reports whether grandmaster gm was announced within masterHold of
+// localNs.
+func (c *Clock) recent(gm [8]byte, localNs uint64) bool {
+	h, ok := c.heard[gm]
+	return ok && int64(localNs-h.atNs) < int64(masterHold)
+}
+
+// hear records an Announce for its grandmaster. The grandmaster's own
+// Announce names it as the Sync source; a relay's is used until it does.
+func (c *Clock) hear(m Message, localNs uint64) {
+	h, ok := c.heard[m.Grandmaster]
+	if !ok && len(c.heard) >= maxHeard {
+		for gm := range c.heard {
+			if !c.recent(gm, localNs) {
+				delete(c.heard, gm)
+			}
+		}
+		if len(c.heard) >= maxHeard {
+			clear(c.heard)
+		}
+	}
+	if c.heard == nil {
+		c.heard = make(map[[8]byte]heardMaster)
+	}
+	if !ok || h.source != m.Grandmaster {
+		h.source = m.Header.ClockID
+	}
+	h.atNs = localNs
+	c.heard[m.Grandmaster] = h
+	c.lastAnnounceNs = localNs
+}
+
+// selectMaster follows grandmaster gm through Sync from source, with no
+// offset estimate until its first Follow_Up.
+func (c *Clock) selectMaster(gm, source [8]byte) {
+	c.masterID = gm
+	c.sourceID = source
 	c.syncs = nil
 	c.offsetNs = 0
 	c.valid = false
 	c.samples = 0
 	c.stepCount = 0
-	notify, event := c.onMasterChange, MasterChange{From: from, To: m.Grandmaster, Carried: c.anchorSet && c.carried}
-	c.mu.Unlock()
-	if changed && notify != nil {
-		notify(event)
-	}
 }
 
 // HandleSync retains the event packet's receive time for its Follow_Up.
@@ -371,15 +463,53 @@ func (c *Clock) LocalTime(masterNs uint64) (uint64, bool) {
 // SetAnchor records the sender's playback anchor: the RTP frame Frame will be
 // presented at grandmaster time MasterNs, and subsequent frames follow at the
 // sample rate Rate. An anchor with a non-positive rate is ignored.
+//
+// A.ClockID, when set, names the grandmaster whose epoch MasterNs is in
+// (the sender's timeline). It becomes the preferred grandmaster, and the
+// clock switches to it at once if it was announced within masterHold of the
+// newest Announce. Converting the anchor with another grandmaster's offset
+// would schedule its frames hours early or late.
 func (c *Clock) SetAnchor(a Anchor) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if a.Rate <= 0 {
+		c.mu.Unlock()
 		return
 	}
+	notify, event := c.selectTimeline(a.ClockID)
 	c.anchor = a
 	c.anchorSet = true
 	c.carried = false
+	c.mu.Unlock()
+	if notify != nil {
+		notify(event)
+	}
+}
+
+// SelectTimeline makes grandmaster gm, the one a sender's anchors refer to,
+// the preferred grandmaster, as SetAnchor does. It reports whether gm is the
+// selected grandmaster afterwards.
+func (c *Clock) SelectTimeline(gm [8]byte) bool {
+	c.mu.Lock()
+	notify, event := c.selectTimeline(gm)
+	selected := c.masterID == gm
+	c.mu.Unlock()
+	if notify != nil {
+		notify(event)
+	}
+	return selected
+}
+
+func (c *Clock) selectTimeline(gm [8]byte) (func(MasterChange), MasterChange) {
+	if gm == ([8]byte{}) {
+		return nil, MasterChange{}
+	}
+	c.timeline = gm
+	if gm == c.masterID || !c.recent(gm, c.lastAnnounceNs) {
+		return nil, MasterChange{}
+	}
+	event := MasterChange{From: c.masterID, To: gm, AnchorTimeline: true}
+	c.selectMaster(gm, c.heard[gm].source)
+	return c.onMasterChange, event
 }
 
 // ClearAnchor starts a new RTP timestamp epoch while retaining PTP sync.

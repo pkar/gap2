@@ -201,7 +201,7 @@ func TestClockAnnounceResetsOffset(t *testing.T) {
 
 	// A new grandmaster invalidates the estimate.
 	gm := [8]byte{0xde, 0xad, 0xbe, 0xef}
-	c.HandleAnnounce(Message{Grandmaster: gm})
+	c.HandleAnnounce(Message{Grandmaster: gm}, 0)
 	if _, ok := c.Offset(); ok {
 		t.Fatal("offset still available after grandmaster change")
 	}

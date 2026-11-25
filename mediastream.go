@@ -640,11 +640,13 @@ func (h *mediaHandler) handleControlPacket(pkt []byte, rate int) {
 		return
 	}
 	// Cross-check the anchor's clock against the grandmaster the clock is
-	// synchronized to. An anchor for a different clock is stale and must not
-	// be adopted; the sender will re-announce against the new master. A zero
-	// master identity means no Announce has selected a master yet, so there is
-	// nothing to compare against and the anchor is accepted.
-	if master := h.clock.Info().MasterID; master != ([8]byte{}) && master != clockID {
+	// synchronized to, after switching to it if it is announcing (another
+	// group's grandmaster may have been selected first). An anchor for a
+	// clock that is not announcing is stale and must not be adopted; the
+	// sender will re-announce against the new master. A zero master identity
+	// means no Announce has selected a master yet, so there is nothing to
+	// compare against and the anchor is accepted.
+	if master := h.clock.Info().MasterID; master != ([8]byte{}) && !h.clock.SelectTimeline(clockID) {
 		h.log.Warn("AP2 control anchor clock mismatch",
 			"anchorClock", fmt.Sprintf("%x", clockID), "masterClock", fmt.Sprintf("%x", master))
 		return
@@ -848,7 +850,7 @@ func (h *mediaHandler) setRateAnchor(cs *connState, req *ctlRequest) error {
 	}
 	if h.clock != nil {
 		h.clock.SetAnchor(anchor)
-		h.log.Debug("AP2 playback anchor", "frame", anchor.Frame, "masterNs", anchor.MasterNs, "synced", h.clock.Status().Synced)
+		h.log.Debug("AP2 playback anchor", "frame", anchor.Frame, "masterNs", anchor.MasterNs, "timeline", fmt.Sprintf("%x", anchor.ClockID), "master", fmt.Sprintf("%x", h.clock.Info().MasterID), "synced", h.clock.Status().Synced)
 	}
 	if h.playout != nil {
 		_ = h.playout.SetPaused(h.ctx, false)
